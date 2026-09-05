@@ -769,7 +769,7 @@ async fn expired_code_and_certificate_have_separate_lifetimes() {
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(matches!(
         MessagingEndpoint::join(config(), Identity::generate(), &code).await,
-        Err(Error::CertificateExpired)
+        Err(Error::Unauthorized)
     ));
     assert_eq!(a.metrics().await.unwrap().peers, 1);
     timeout(Duration::from_secs(4), async {
@@ -887,6 +887,7 @@ async fn relay_only_join_code_connects_two_then_three_peers() {
         .issue_join_code(JoinOptions::new(vec![Permission::publish("jobs").unwrap()]))
         .await
         .unwrap();
+    let code = JoinCode::decode(&code.encode().unwrap()).unwrap();
     let mut sub = a
         .subscribe("jobs", SubscriptionOptions::acknowledged())
         .await
@@ -965,4 +966,36 @@ async fn idle_publishers_do_not_reserve_another_publishers_receive_capacity() {
     r.wait_for_processing(wait_timeout()).await.unwrap();
     close(&idle, &receiver).await;
     active.shutdown(ShutdownMode::Immediate).await.unwrap();
+}
+
+#[tokio::test]
+async fn rejoin_rejects_a_new_realm_even_if_host_reuses_its_transport_key() {
+    let identity = Identity::generate();
+    let a = MessagingEndpoint::host(config(), identity.clone(), vec![])
+        .await
+        .unwrap();
+    let code = a.issue_join_code(JoinOptions::new(vec![])).await.unwrap();
+    let code = JoinCode::decode(&code.encode().unwrap()).unwrap();
+    let b = MessagingEndpoint::join(config(), Identity::generate(), &code)
+        .await
+        .unwrap();
+    let previous_certificate = b.certificate();
+    a.shutdown(ShutdownMode::Immediate).await.unwrap();
+    let restarted = MessagingEndpoint::host(config(), identity, vec![])
+        .await
+        .unwrap();
+    let new_code = restarted
+        .issue_join_code(JoinOptions::new(vec![]))
+        .await
+        .unwrap();
+    let new_code = JoinCode::decode(&new_code.encode().unwrap()).unwrap();
+    assert_eq!(new_code.host_id(), code.host_id());
+    assert_eq!(b.rejoin(&new_code).await, Err(Error::Unauthorized));
+    assert_eq!(b.certificate().id(), previous_certificate.id());
+    // Explicitly joining anew can accept the restarted host's new authority and realm.
+    let fresh = MessagingEndpoint::join(config(), Identity::generate(), &new_code)
+        .await
+        .unwrap();
+    close(&restarted, &fresh).await;
+    b.shutdown(ShutdownMode::Immediate).await.unwrap();
 }

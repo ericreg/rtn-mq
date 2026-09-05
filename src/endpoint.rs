@@ -302,18 +302,19 @@ impl MessagingEndpoint {
         if identity.endpoint_id() == code.host_id() {
             return Err(Error::Unauthorized);
         }
-        let config = EndpointConfig {
-            settings: config,
-            trust: code.trust(),
-        };
         let endpoint = transport::bind(&config, &identity).await?;
-        let certificate = match crate::join::redeem(&endpoint, &config, code).await {
-            Ok(certificate) => certificate,
+        let enrollment = match crate::join::redeem(&endpoint, &config, code, None).await {
+            Ok(enrollment) => enrollment,
             Err(error) => {
                 endpoint.close().await;
                 return Err(error);
             }
         };
+        let config = EndpointConfig {
+            settings: config,
+            trust: enrollment.trust,
+        };
+        let certificate = enrollment.certificate;
         let host = code.host_id();
         let client = Self::start_bound(
             config,
@@ -410,15 +411,18 @@ impl MessagingEndpoint {
     /// Re-enroll and reconnect to the same host using a currently valid code.
     /// Preserves identity, publisher epoch, subscriptions, and retained publications.
     pub async fn rejoin(&self, code: &JoinCode) -> Result<()> {
-        if self.handle.host != Some(code.host_id())
-            || self.handle.config.trust.root() != code.authority()
-            || self.handle.config.trust.realm_id() != code.realm_id()
-        {
+        if self.handle.host != Some(code.host_id()) {
             return Err(Error::Unauthorized);
         }
         let _memory = self.handle.metadata.reserve(128 * 1024)?;
-        let certificate =
-            crate::join::redeem(&self.handle.endpoint, &self.handle.config, code).await?;
+        let enrollment = crate::join::redeem(
+            &self.handle.endpoint,
+            &self.handle.config,
+            code,
+            Some(&self.handle.config.trust),
+        )
+        .await?;
+        let certificate = enrollment.certificate;
         self.handle
             .request(|reply| Command::Renew { certificate, reply })
             .await?;

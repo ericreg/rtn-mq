@@ -9,11 +9,11 @@ use iroh::endpoint::{Connection, Incoming, QuicTransportConfig, RecvStream, Send
 use tokio::{task::JoinSet, time::timeout};
 const ALPN: &[u8] = b"iroh-mq/1";
 
-pub(super) async fn bind(config: &EndpointConfig, identity: &Identity) -> Result<Endpoint> {
+pub(super) async fn bind(config: &Config, identity: &Identity) -> Result<Endpoint> {
     bind_protocol(config, identity, ALPN).await
 }
 pub(crate) async fn bind_protocol(
-    config: &EndpointConfig,
+    config: &Config,
     identity: &Identity,
     alpn: &[u8],
 ) -> Result<Endpoint> {
@@ -457,7 +457,7 @@ mod tests {
         victim.shutdown(ShutdownMode::Immediate).await.unwrap();
         let config = EndpointConfig {
             settings: settings(),
-            trust: code.trust(),
+            trust: host.handle.config.trust.clone(),
         };
         let thief = bind(&config, &Identity::generate()).await.unwrap();
         let conn = thief.connect(code.address, ALPN).await.unwrap();
@@ -536,12 +536,18 @@ mod tests {
             .unwrap();
         let config = EndpointConfig {
             settings: settings(),
-            trust: code.trust(),
+            trust: host.handle.config.trust.clone(),
         };
         let raw = bind(&config, &Identity::generate()).await.unwrap();
-        let cert = crate::join::redeem(&raw, &config, &code).await.unwrap();
+        let cert = crate::join::redeem(&raw, &config, &code, Some(&config.trust))
+            .await
+            .unwrap()
+            .certificate;
         // A lost enrollment response can be recovered by the same authenticated key.
-        let recovered = crate::join::redeem(&raw, &config, &code).await.unwrap();
+        let recovered = crate::join::redeem(&raw, &config, &code, Some(&config.trust))
+            .await
+            .unwrap()
+            .certificate;
         assert_eq!(cert.id(), recovered.id());
         let conn = raw.connect(code.address, ALPN).await.unwrap();
         let mut h = handshake(&conn, true, &config, &cert).await.unwrap();
@@ -576,10 +582,13 @@ mod tests {
             .unwrap();
         let config = EndpointConfig {
             settings: settings(),
-            trust: code.trust(),
+            trust: host.handle.config.trust.clone(),
         };
         let raw = bind(&config, &Identity::generate()).await.unwrap();
-        let cert = crate::join::redeem(&raw, &config, &code).await.unwrap();
+        let cert = crate::join::redeem(&raw, &config, &code, Some(&config.trust))
+            .await
+            .unwrap()
+            .certificate;
         let conn = raw.connect(b.handle.endpoint.addr(), ALPN).await.unwrap();
         let _ = handshake(&conn, true, &config, &cert).await;
         timeout(Duration::from_secs(3), conn.closed())

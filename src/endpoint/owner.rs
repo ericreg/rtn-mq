@@ -57,7 +57,7 @@ pub(crate) enum Command {
         peer: EndpointId,
         id: Id,
         secret: [u8; 32],
-        reply: oneshot::Sender<Result<Certificate>>,
+        reply: oneshot::Sender<Result<crate::join::Enrollment>>,
     },
     Connect {
         address: EndpointAddr,

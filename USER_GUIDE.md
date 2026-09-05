@@ -57,6 +57,8 @@ Share this code privately. Waiting for messages; press Ctrl+C to stop.
 
 The real code is a longer string. Copy the entire string beginning with `rtn-mq://join/`, without the `Join code:` label, and give it privately to the intended joining machines. Anyone holding the code can register with its permissions while it remains valid. An authenticated private chat or your usual trusted configuration channel is sufficient; no file transfer is required.
 
+The compact code is typically about **161 characters with one relay**, or **121 characters with one IPv4 address** in direct-only mode. Extra addresses or longer custom relay URLs increase its length. It contains A's public key, its connection route, and a secret that grants permission to join. Keep the whole code; truncating it makes it unusable. Older version 1 and 2 codes are no longer accepted: update both computers, restart the host, and copy its newly generated code.
+
 Leave A running. It has subscribed to the topic `quickstart/messages`. A **topic** is a string naming a category of messages. Subscribing asks to receive messages in that category.
 
 #### Step B: join and send a message
@@ -67,7 +69,7 @@ On B, replace `PASTE_JOIN_CODE_HERE` with A's full code, keeping the quotes:
 cargo run --locked --example two_computers -- join "PASTE_JOIN_CODE_HERE" "Hello from computer B"
 ```
 
-B generates its own private key and contacts A. A checks the code and issues B a **certificate**, a signed record allowing it to publish on `quickstart/messages`. B then establishes an authenticated messaging session, waits for the host's subscription, and sends its message.
+B generates its own private key and authenticates A using the public key in the code. A checks the secret and supplies the messaging group's ID, its authority public key, the code expiry, and a **certificate**, a signed record allowing it to publish on `quickstart/messages`. B verifies the certificate against the authority supplied by A, then establishes an authenticated messaging session, waits for the host's subscription, and sends its message.
 
 B should print:
 
@@ -104,7 +106,7 @@ The join code is an enrollment credential. Keep it out of public repositories an
 
 #### Option: connect directly on the same LAN
 
-Default networking uses Iroh's relays and address lookup. A **relay** helps establish or carry encrypted connections when peers cannot reach one another directly. Both computers need access to the configured services.
+Default networking uses Iroh's relays and address lookup. A **relay** helps establish or carry encrypted connections when peers cannot reach one another directly. Both computers need access to the configured services. A relay-backed code carries the relay address instead of every network interface address, keeping it short. The relay is needed for initial contact; Iroh can then negotiate a direct connection. For a LAN without relay access, use the direct-only commands below.
 
 For a direct-only LAN connection, supply each computer's own local address with `--bind`. For example, if A is `192.168.1.20` and B is `192.168.1.21`:
 
@@ -173,7 +175,7 @@ async fn join_host(encoded_code: &str, identity: Identity) -> Result<MessagingEn
 }
 ```
 
-The trusted code pins the realm, authority public key, and host endpoint ID. It grants enrollment permission to its holder. `join()` performs enrollment and the messaging handshake before returning; there is no separate address-based `connect()` call. Joining peers cannot issue codes in that realm.
+The trusted code pins the host endpoint ID and grants enrollment permission to its holder. The host supplies the realm, authority public key, code expiry, and signed certificate over the authenticated enrollment connection. The client checks the certificate signature, its own identity, the realm, and validity before accepting it. Sharing a code therefore means trusting that host to choose the network authority. `join()` performs enrollment and the messaging handshake before returning; there is no separate address-based `connect()` call. Joining peers cannot issue codes in that realm.
 
 A network connection and a ready subscription are separate conditions. When the subscriber knows the publisher's endpoint ID, call `subscription.wait_ready(publisher_id, Duration::from_secs(5)).await?`. The two-computer example instead waits on the publishing side for `NoSubscribers` to stop occurring before it has admitted a message.
 
@@ -193,11 +195,13 @@ Run the subscriber's receive loop while publishers are waiting. Decode the CBOR 
 | `host.revoke_join_code(code.id())` | Disable future enrollment through that code. Existing certificates and sessions remain valid. |
 | `host.deny_certificate(peer.certificate().id())` | Revoke that particular certificate, including existing sessions and retained deliveries. |
 
+A code no longer contains the realm, authority key, or expiry, so it cannot report those values before contacting its host. The old `JoinCode::realm_id()`, `authority()`, and `expires_at()` accessors have been removed. Hosts control expiry through `JoinOptions::lifetime`; clients receive and check it during enrollment.
+
 Limits are checked by the host, including concurrent joins. Code expiry, revocation, and usage counts live on the host; editing the encoded code cannot extend them. `Config::max_topics` also bounds active codes, `max_peers` bounds unexpired issued certificate records, and the metadata budget charges all retained code/membership state. Disconnecting does not free a registration record before its certificate expires.
 
 ## Rejoin, lifetime, and shutdown
 
-Keep the same `MessagingEndpoint` and call `peer.rejoin(&code).await?` after a connection loss. The code must currently be valid and belong to the same host and realm. A new code issued by that host can also authorize a new certificate. Wait for subscription readiness again after reconnecting.
+Keep the same `MessagingEndpoint` and call `peer.rejoin(&code).await?` after a connection loss. The code must currently be valid and target the same host. The host's reply must match the authority and realm accepted during the first join; `rejoin` never replaces them. A new code issued by that host can also authorize a new certificate. Wait for subscription readiness again after reconnecting.
 
 `rejoin` preserves the running endpoint's identity, publisher epoch, retained message IDs, and still-authorized subscriptions. It retrieves a cached valid certificate or renews an expired grant; changing code permissions is enforced when the replacement authorization is installed. Failed enrollment leaves the previous authorization in place. Expiring/revoking a code does not itself revoke previously issued certificates, but a new valid code is required for a subsequent rejoin.
 
@@ -227,9 +231,9 @@ Keep receive/ACK tasks running while draining. Unfinished work is reported when 
 | Symptom | Check |
 |---|---|
 | Code decoding fails | Paste the entire `rtn-mq://join/…` string, without the label. Old contact codes and setup files are unsupported. |
-| `Unauthorized` when joining/rejoining | The host may have disabled the code or revoked the cached certificate. A rejoin must target the original host and realm. |
+| `Unauthorized` when joining/rejoining | The code may have expired or been disabled, or the cached certificate may have been revoked. A rejoin must retain the original host, authority, and realm. |
 | `QueueFull` during enrollment | The code's registration limit, host certificate-record limit, code-count limit, or metadata budget may be full. |
-| `CertificateExpired` | Check code/certificate expiry and both machines' clocks. Obtain a new valid code if needed. |
+| `CertificateExpired` | The returned code expiry or certificate validity failed a clock check. Check both machines' clocks and obtain a new code if needed. Host rejection of an expired code is `Unauthorized`. |
 | Relay wait or connection times out | Check network access and that the host is still running. On a reachable LAN, try the direct `--bind` option. |
 | `Unauthorized` for a topic | Verify the exact topic and both sides' permissions. Being enrolled does not grant every topic. |
 | `NoSubscribers` | Wait for subscription readiness; keep the subscription handle alive. Dropping it unsubscribes. |

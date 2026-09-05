@@ -3,19 +3,24 @@ use crate::{
     auth::{self, MAX_CERT, MAX_PERMISSIONS},
     buffer::{Budget, Permit},
     cbor::{Reader, Writer},
-    endpoint::{EndpointConfig, owner::Command},
+    endpoint::owner::Command,
     error::transport,
     message::digest,
     wire, *,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use iroh::{Endpoint, EndpointAddr, endpoint::Connection};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     sync::{mpsc, oneshot},
     time::timeout,
 };
-pub(crate) const ALPN: &[u8] = b"iroh-mq/join/1";
+pub(crate) const ALPN: &[u8] = b"iroh-mq/join/2";
 const PREFIX: &str = "rtn-mq://join/";
 
 /// Permission and registration limits attached to a reusable code.
@@ -56,65 +61,66 @@ impl JoinOptions {
 /// Debug omits the secret; encode() explicitly reveals the transferable code.
 #[derive(Clone)]
 pub struct JoinCode {
-    realm: RealmId,
-    root: EndpointId,
     pub(crate) address: EndpointAddr,
-    id: [u8; 16],
-    expires: u64,
     secret: [u8; 32],
 }
 impl std::fmt::Debug for JoinCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JoinCode")
             .field("host", &self.host_id())
-            .field("expires", &self.expires)
             .finish_non_exhaustive()
     }
 }
 impl JoinCode {
     pub fn id(&self) -> [u8; 16] {
-        self.id
-    }
-    pub fn expires_at(&self) -> u64 {
-        self.expires
+        // Domain separation keeps the public identifier distinct from the stored secret hash.
+        let mut input = b"iroh-mq/join-code-id/v3".to_vec();
+        input.extend_from_slice(&self.secret);
+        digest(&input)[..16].try_into().unwrap()
     }
     pub fn host_id(&self) -> EndpointId {
         self.address.id
     }
-    pub fn realm_id(&self) -> RealmId {
-        self.realm
-    }
-    pub fn authority(&self) -> EndpointId {
-        self.root
-    }
-    pub(crate) fn trust(&self) -> Trust {
-        Trust::new(self.realm, self.root)
-    }
+    /// Encode a compact v3 code. Relay hints replace interface addresses when available.
     pub fn encode(&self) -> Result<String> {
-        let addresses: Vec<String> = self
-            .address
-            .ip_addrs()
-            .map(|a| format!("ip:{a}"))
-            .chain(self.address.relay_urls().map(|a| format!("relay:{a}")))
-            .collect();
-        if addresses.len() > 16 {
-            return Err(Error::MessageTooLarge);
+        let address = compact_address(&self.address);
+        let count = address.ip_addrs().count() + address.relay_urls().count();
+        if count == 0 || count > 16 {
+            return Err(Error::Protocol("join address count"));
         }
         let mut w = Writer::new();
-        w.array(8);
-        w.u(1);
-        w.bytes(&self.realm);
-        w.bytes(self.root.as_bytes());
-        w.bytes(self.address.id.as_bytes());
-        w.array(addresses.len());
-        for address in addresses {
-            if address.len() > 1024 {
+        w.array(4);
+        w.u(3);
+        w.bytes(address.id.as_bytes());
+        w.array(count);
+        for ip in address.ip_addrs() {
+            w.array(2);
+            match ip {
+                SocketAddr::V4(ip) => {
+                    w.u(0);
+                    let mut bytes = ip.ip().octets().to_vec();
+                    bytes.extend_from_slice(&ip.port().to_be_bytes());
+                    w.bytes(&bytes);
+                }
+                SocketAddr::V6(ip) => {
+                    w.u(1);
+                    let mut bytes = ip.ip().octets().to_vec();
+                    bytes.extend_from_slice(&ip.port().to_be_bytes());
+                    bytes.extend_from_slice(&ip.flowinfo().to_be_bytes());
+                    bytes.extend_from_slice(&ip.scope_id().to_be_bytes());
+                    w.bytes(&bytes);
+                }
+            }
+        }
+        for relay in address.relay_urls() {
+            let url = relay.as_str();
+            if url.len() > 1024 {
                 return Err(Error::MessageTooLarge);
             }
-            w.text(&address);
+            w.array(2);
+            w.u(2);
+            w.text(url);
         }
-        w.bytes(&self.id);
-        w.u(self.expires);
         w.bytes(&self.secret);
         Ok(format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(w.finish())))
     }
@@ -129,42 +135,57 @@ impl JoinCode {
             .decode(encoded)
             .map_err(|_| Error::Protocol("join code base64"))?;
         let mut r = Reader::new(&bytes);
-        r.array(8)?;
-        auth::version(r.u()?)?;
-        let realm = r.fixed()?;
-        let root = auth::endpoint(r.fixed()?)?;
+        r.array(4)?;
+        if r.u()? != 3 {
+            return Err(Error::Protocol("join code version"));
+        }
         let mut address = EndpointAddr::new(auth::endpoint(r.fixed()?)?);
         for _ in 0..r.list(16)? {
-            let a = r.text(1024)?;
-            if let Some(ip) = a.strip_prefix("ip:") {
-                address = address
-                    .with_ip_addr(ip.parse().map_err(|_| Error::Protocol("join IP address"))?);
-            } else if let Some(relay) = a.strip_prefix("relay:") {
-                address = address.with_relay_url(
-                    relay
+            r.array(2)?;
+            address = match r.u()? {
+                0 => {
+                    let bytes: [u8; 6] = r.fixed()?;
+                    let ip = Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]);
+                    let port = u16::from_be_bytes(bytes[4..6].try_into().unwrap());
+                    address.with_ip_addr(SocketAddr::from((ip, port)))
+                }
+                1 => {
+                    let bytes: [u8; 26] = r.fixed()?;
+                    let ip = Ipv6Addr::from(<[u8; 16]>::try_from(&bytes[..16]).unwrap());
+                    let port = u16::from_be_bytes(bytes[16..18].try_into().unwrap());
+                    let flow = u32::from_be_bytes(bytes[18..22].try_into().unwrap());
+                    let scope = u32::from_be_bytes(bytes[22..26].try_into().unwrap());
+                    address.with_ip_addr(SocketAddr::V6(SocketAddrV6::new(ip, port, flow, scope)))
+                }
+                2 => address.with_relay_url(
+                    r.text(1024)?
                         .parse()
                         .map_err(|_| Error::Protocol("join relay address"))?,
-                );
-            } else {
-                return Err(Error::Protocol("join address type"));
-            }
+                ),
+                _ => return Err(Error::Protocol("join address type")),
+            };
         }
-        let id = r.fixed()?;
-        let expires = r.u()?;
         let secret = r.fixed()?;
         r.end()?;
-        let value = Self {
-            realm,
-            root,
-            address,
-            id,
-            expires,
-            secret,
-        };
+        let value = Self { address, secret };
         if value.encode()? != code {
             return Err(Error::Protocol("noncanonical join code"));
         }
         Ok(value)
+    }
+}
+
+// A relay is sufficient to bootstrap Iroh's authenticated path negotiation. Direct-only
+// deployments retain all IP hints, without relying on a directory or address lookup service.
+fn compact_address(address: &EndpointAddr) -> EndpointAddr {
+    if address.relay_urls().next().is_some() {
+        address
+            .relay_urls()
+            .fold(EndpointAddr::new(address.id), |addr, relay| {
+                addr.with_relay_url(relay.clone())
+            })
+    } else {
+        address.clone()
     }
 }
 
@@ -242,20 +263,15 @@ impl Admission {
                 .map(|p| p.topic.as_str().len() + 128)
                 .sum::<usize>(),
         )?;
-        let id = rand::random();
         let secret: [u8; 32] = rand::random();
         let expires = now + options.lifetime.as_secs();
         let code = JoinCode {
-            realm: host.authority.realm_id(),
-            root: host.authority.public_key(),
-            address,
-            id,
-            expires,
+            address: compact_address(&address),
             secret,
         };
         code.encode()?;
         host.codes.insert(
-            id,
+            code.id(),
             Grant {
                 hash: digest(&secret),
                 expires,
@@ -284,7 +300,7 @@ impl Admission {
         trust: &Trust,
         budget: &Arc<Budget>,
         max_members: usize,
-    ) -> Result<Certificate> {
+    ) -> Result<Enrollment> {
         let Self::Host(host) = self else {
             return Err(Error::Unauthorized);
         };
@@ -296,7 +312,13 @@ impl Admission {
         }
         if let Some(cert) = grant.redeemed.get(&peer) {
             match trust.check(cert, peer, now) {
-                Ok(()) if now < cert.expires_at() => return Ok(cert.clone()),
+                Ok(()) if now < cert.expires_at() => {
+                    return Ok(Enrollment {
+                        trust: host.authority.trust(),
+                        expires: grant.expires,
+                        certificate: cert.clone(),
+                    });
+                }
                 Ok(()) | Err(Error::CertificateExpired) => {}
                 Err(error) => return Err(error),
             }
@@ -326,7 +348,11 @@ impl Admission {
             },
         );
         grant.redeemed.insert(peer, cert.clone());
-        Ok(cert)
+        Ok(Enrollment {
+            trust: host.authority.trust(),
+            expires: grant.expires,
+            certificate: cert,
+        })
     }
     pub fn prune(&mut self, now: u64) {
         if let Self::Host(host) = self {
@@ -343,26 +369,83 @@ impl Drop for Close {
     }
 }
 
+/// Metadata supplied only over the connection authenticated by the code's host key.
+pub(crate) struct Enrollment {
+    pub trust: Trust,
+    pub expires: u64,
+    pub certificate: Certificate,
+}
+impl Enrollment {
+    fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.array(5);
+        w.u(2);
+        w.bytes(&self.trust.realm_id());
+        w.bytes(self.trust.root().as_bytes());
+        w.u(self.expires);
+        w.bytes(self.certificate.as_bytes());
+        w.finish()
+    }
+    fn decode(bytes: &[u8], peer: EndpointId, expected: Option<&Trust>, now: u64) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        r.array(5)?;
+        join_version(r.u()?)?;
+        let realm = r.fixed()?;
+        let root = auth::endpoint(r.fixed()?)?;
+        let expires = r.u()?;
+        let certificate = Certificate::from_bytes(r.bytes(MAX_CERT)?)?;
+        r.end()?;
+        let value = Self {
+            trust: Trust::new(realm, root),
+            expires,
+            certificate,
+        };
+        crate::cbor::canonical(bytes, &value.encode())?;
+        // Rejoining must preserve the established authority and realm, including when a
+        // restarted host reuses its transport identity. Never replace existing trust here.
+        if let Some(trust) = expected
+            && (trust.root() != root || trust.realm_id() != realm)
+        {
+            return Err(Error::Unauthorized);
+        }
+        if expires <= now {
+            return Err(Error::CertificateExpired);
+        }
+        expected
+            .unwrap_or(&value.trust)
+            .verify(&value.certificate, peer, now)?;
+        Ok(value)
+    }
+}
+fn join_version(version: u64) -> Result<()> {
+    if version != 2 {
+        return Err(Error::Protocol("join protocol version"));
+    }
+    Ok(())
+}
+
 pub(crate) async fn redeem(
     endpoint: &Endpoint,
-    config: &EndpointConfig,
+    config: &Config,
     code: &JoinCode,
-) -> Result<Certificate> {
-    if code.expires <= auth::now()? {
-        return Err(Error::CertificateExpired);
-    }
+    expected: Option<&Trust>,
+) -> Result<Enrollment> {
     timeout(config.handshake_timeout, async {
         let conn = endpoint
             .connect(code.address.clone(), ALPN)
             .await
             .map_err(transport)?;
         let _close = Close(conn.clone());
+        // Iroh authenticates this identity during connect, before any secret is sent.
+        if conn.remote_id() != code.host_id() {
+            return Err(Error::Unauthorized);
+        }
         let exchange = async {
             let (mut send, mut recv) = conn.open_bi().await.map_err(transport)?;
             let mut w = Writer::new();
             w.array(3);
-            w.u(1);
-            w.bytes(&code.id);
+            w.u(2);
+            w.bytes(&code.id());
             w.bytes(&code.secret);
             wire::write_frame(&mut send, wire::HELLO, &w.finish(), &[]).await?;
             let h = wire::read_header(&mut recv, 0)
@@ -370,35 +453,27 @@ pub(crate) async fn redeem(
                 .ok_or(Error::PeerUnavailable)?;
             let mut bytes = vec![0; h.metadata];
             recv.read_exact(&mut bytes).await.map_err(transport)?;
-            let mut r = Reader::new(&bytes);
-            r.array(2)?;
-            auth::version(r.u()?)?;
             if h.kind == 11 {
-                let code = r.u()?;
+                let mut r = Reader::new(&bytes);
+                r.array(2)?;
+                join_version(r.u()?)?;
+                let reason = r.u()?;
                 r.end()?;
                 let mut expected = Writer::new();
                 expected.array(2);
-                expected.u(1);
-                expected.u(code);
+                expected.u(2);
+                expected.u(reason);
                 crate::cbor::canonical(&bytes, &expected.finish())?;
-                return Err(if code == 2 {
-                    Error::QueueFull
-                } else {
-                    Error::Unauthorized
+                return Err(match reason {
+                    1 => Error::Unauthorized,
+                    2 => Error::QueueFull,
+                    _ => Error::Protocol("join rejection reason"),
                 });
             }
             if h.kind != wire::READY {
                 return Err(Error::Protocol("join response"));
             }
-            let cert = Certificate::from_bytes(r.bytes(MAX_CERT)?)?;
-            r.end()?;
-            let mut expected = Writer::new();
-            expected.array(2);
-            expected.u(1);
-            expected.bytes(cert.as_bytes());
-            crate::cbor::canonical(&bytes, &expected.finish())?;
-            config.trust.verify(&cert, endpoint.id(), auth::now()?)?;
-            Ok(cert)
+            Enrollment::decode(&bytes, endpoint.id(), expected, auth::now()?)
         }
         .await;
         conn.close(0u32.into(), b"join completed");
@@ -420,13 +495,13 @@ pub(crate) async fn serve(conn: Connection, tx: mpsc::Sender<Command>) -> Result
     recv.read_exact(&mut bytes).await.map_err(transport)?;
     let mut r = Reader::new(&bytes);
     r.array(3)?;
-    auth::version(r.u()?)?;
+    join_version(r.u()?)?;
     let id = r.fixed()?;
     let secret = r.fixed()?;
     r.end()?;
     let mut expected = Writer::new();
     expected.array(3);
-    expected.u(1);
+    expected.u(2);
     expected.bytes(&id);
     expected.bytes(&secret);
     crate::cbor::canonical(&bytes, &expected.finish())?;
@@ -440,20 +515,17 @@ pub(crate) async fn serve(conn: Connection, tx: mpsc::Sender<Command>) -> Result
     .await
     .map_err(|_| Error::ShuttingDown)?;
     let result = rx.await.map_err(|_| Error::ShuttingDown)?;
-    let mut w = Writer::new();
-    w.array(2);
-    w.u(1);
-    let kind = match result {
-        Ok(cert) => {
-            w.bytes(cert.as_bytes());
-            wire::READY
-        }
+    let (kind, bytes) = match result {
+        Ok(enrollment) => (wire::READY, enrollment.encode()),
         Err(error) => {
+            let mut w = Writer::new();
+            w.array(2);
+            w.u(2);
             w.u(if error == Error::QueueFull { 2 } else { 1 });
-            11
+            (11, w.finish())
         }
     };
-    wire::write_frame(&mut send, kind, &w.finish(), &[]).await?;
+    wire::write_frame(&mut send, kind, &bytes, &[]).await?;
     send.finish().map_err(transport)?;
     let _ = send.stopped().await;
     Ok(())
@@ -473,18 +545,214 @@ mod tests {
         let encoded = format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(&bytes));
         let fixture = JoinCode::decode(&encoded).unwrap();
         let expected = JoinCode {
-            realm: [3; 16],
-            root: iroh::SecretKey::from_bytes(&[1; 32]).public(),
             address: EndpointAddr::new(iroh::SecretKey::from_bytes(&[2; 32]).public())
                 .with_ip_addr("127.0.0.1:42000".parse().unwrap()),
-            id: [4; 16],
-            expires: 200,
             secret: [9; 32],
         };
         assert_eq!(expected.encode().unwrap(), encoded);
-        assert_eq!(fixture.id(), [4; 16]);
-        assert_eq!(fixture.expires_at(), 200);
+        // Independently calculated with Python hashlib and the protocol domain string.
+        assert_eq!(
+            fixture.id(),
+            [
+                207, 105, 51, 178, 72, 186, 118, 171, 10, 128, 224, 144, 54, 130, 35, 245
+            ]
+        );
     }
+    fn sample(address: EndpointAddr) -> JoinCode {
+        JoinCode {
+            address,
+            secret: [9; 32],
+        }
+    }
+
+    #[test]
+    fn relay_codes_stay_short_regardless_of_interface_count() {
+        let host = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let relay = "https://usw1-1.relay.n0.iroh.link./".parse().unwrap();
+        let mut address = EndpointAddr::new(host).with_relay_url(relay);
+        for ip in [
+            "10.0.0.77:63439",
+            "67.183.197.72:63439",
+            "192.168.193.219:63439",
+            "[2601:602:8c01:2b20::c571]:49431",
+            "[2601:602:8c01:2b20:be:1463:f747:230b]:49431",
+            "[2601:602:8c01:2b20:9ce8:9f58:a0c8:31ea]:49431",
+        ] {
+            address = address.with_ip_addr(ip.parse().unwrap());
+        }
+        let code = sample(address);
+        let encoded = code.encode().unwrap();
+        // Includes URI prefix, pinned host, relay URL, and full 256-bit secret.
+        assert_eq!(encoded.len(), 161);
+        let decoded = JoinCode::decode(&encoded).unwrap();
+        assert_eq!(decoded.address, compact_address(&code.address));
+        assert_eq!(decoded.address.ip_addrs().count(), 0);
+        assert_eq!(decoded.id(), code.id());
+    }
+
+    #[test]
+    fn direct_codes_preserve_ipv4_ipv6_ports_and_scopes() {
+        let host = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let address = EndpointAddr::new(host).with_ip_addr("192.168.1.20:42000".parse().unwrap());
+        let code = sample(address.clone());
+        assert_eq!(code.encode().unwrap().len(), 121);
+        assert_eq!(
+            JoinCode::decode(&code.encode().unwrap()).unwrap().address,
+            address
+        );
+        let address = address
+            .with_ip_addr("[2601:602:8c01:2b20::c571]:49431".parse().unwrap())
+            .with_ip_addr(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::LOCALHOST,
+                1234,
+                7,
+                9,
+            )));
+        let code = sample(address.clone());
+        assert_eq!(
+            JoinCode::decode(&code.encode().unwrap()).unwrap().address,
+            address
+        );
+    }
+
+    #[test]
+    fn malformed_routes_and_legacy_codes_are_rejected() {
+        let host = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let code = sample(EndpointAddr::new(host));
+        let encoded_with_routes = |version, routes: &[u8]| {
+            let mut w = Writer::new();
+            w.array(4);
+            w.u(version);
+            w.bytes(host.as_bytes());
+            let mut bytes = w.finish();
+            bytes.extend_from_slice(routes);
+            let mut w = Writer::new();
+            w.bytes(&code.secret);
+            bytes.extend_from_slice(&w.finish());
+            format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes))
+        };
+        // Empty, unknown type, short IPv4, short IPv6, invalid URL, and indefinite list.
+        for routes in [
+            &[0x80][..],
+            &[0x81, 0x82, 3, 0x40],
+            &[0x81, 0x82, 0, 0x41, 0],
+            &[0x81, 0x82, 1, 0x41, 0],
+            &[0x81, 0x82, 2, 0x61, b'?'],
+            &[0x9f, 0xff],
+        ] {
+            assert!(JoinCode::decode(&encoded_with_routes(3, routes)).is_err());
+        }
+        let route = [0x81, 0x82, 0, 0x46, 127, 0, 0, 1, 0xa4, 0x10];
+        for version in [1, 2, 4] {
+            assert!(JoinCode::decode(&encoded_with_routes(version, &route)).is_err());
+        }
+        let mut duplicate = vec![0x82];
+        duplicate.extend_from_slice(&route[1..]);
+        duplicate.extend_from_slice(&route[1..]);
+        assert!(JoinCode::decode(&encoded_with_routes(3, &duplicate)).is_err());
+        let mut too_many = vec![0x91];
+        for _ in 0..17 {
+            too_many.extend_from_slice(&route[1..]);
+        }
+        assert!(JoinCode::decode(&encoded_with_routes(3, &too_many)).is_err());
+    }
+
+    fn bootstrap_fixture() -> Vec<u8> {
+        include_str!("../tests/fixtures/join_bootstrap.hex")
+            .trim()
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn authenticated_bootstrap_verifies_certificate_and_expiry() {
+        let bytes = bootstrap_fixture();
+        let peer = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let enrolled = Enrollment::decode(&bytes, peer, None, 110).unwrap();
+        assert_eq!(enrolled.encode(), bytes);
+        assert_eq!(
+            enrolled.trust.root(),
+            iroh::SecretKey::from_bytes(&[1; 32]).public()
+        );
+        assert_eq!(enrolled.trust.realm_id(), [3; 16]);
+        assert_eq!(enrolled.expires, 180);
+        assert!(matches!(
+            Enrollment::decode(&bytes, Identity::generate().endpoint_id(), None, 110),
+            Err(Error::Unauthorized)
+        ));
+        assert!(matches!(
+            Enrollment::decode(&bytes, peer, None, 180),
+            Err(Error::CertificateExpired)
+        ));
+        assert!(matches!(
+            Enrollment::decode(&bytes, peer, None, 99),
+            Err(Error::CertificateExpired)
+        ));
+        let wrong_root = Enrollment {
+            trust: Trust::new([3; 16], Identity::generate().endpoint_id()),
+            ..enrolled
+        };
+        assert!(matches!(
+            Enrollment::decode(&wrong_root.encode(), peer, None, 110),
+            Err(Error::InvalidSignature)
+        ));
+        let wrong_realm = Enrollment {
+            trust: Trust::new([4; 16], iroh::SecretKey::from_bytes(&[1; 32]).public()),
+            ..wrong_root
+        };
+        assert!(matches!(
+            Enrollment::decode(&wrong_realm.encode(), peer, None, 110),
+            Err(Error::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn bootstrap_cannot_replace_existing_trust_or_bypass_revocation() {
+        let bytes = bootstrap_fixture();
+        let peer = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let enrolled = Enrollment::decode(&bytes, peer, None, 110).unwrap();
+        assert!(Enrollment::decode(&bytes, peer, Some(&enrolled.trust), 110).is_ok());
+        for expected in [
+            Trust::new([4; 16], enrolled.trust.root()),
+            Trust::new([3; 16], Identity::generate().endpoint_id()),
+        ] {
+            assert!(matches!(
+                Enrollment::decode(&bytes, peer, Some(&expected), 110),
+                Err(Error::Unauthorized)
+            ));
+        }
+        let mut revoked = enrolled.trust;
+        revoked.deny_certificate(enrolled.certificate.id()).unwrap();
+        assert!(matches!(
+            Enrollment::decode(&bytes, peer, Some(&revoked), 110),
+            Err(Error::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn bootstrap_rejects_truncation_legacy_versions_and_noncanonical_cbor() {
+        let bytes = bootstrap_fixture();
+        let peer = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        for end in 0..bytes.len() {
+            assert!(Enrollment::decode(&bytes[..end], peer, None, 110).is_err());
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(Enrollment::decode(&trailing, peer, None, 110).is_err());
+        let mut version = bytes.clone();
+        version[1] = 1;
+        assert!(Enrollment::decode(&version, peer, None, 110).is_err());
+        let mut noncanonical = vec![bytes[0], 0x18, 2];
+        noncanonical.extend_from_slice(&bytes[2..]);
+        assert!(Enrollment::decode(&noncanonical, peer, None, 110).is_err());
+        let mut indefinite = bytes.clone();
+        indefinite[0] = 0x9f;
+        indefinite.push(0xff);
+        assert!(Enrollment::decode(&indefinite, peer, None, 110).is_err());
+    }
+
     #[tokio::test]
     async fn codes_are_canonical_bounded_redacted_and_secret_authenticated() {
         let mut settings = Config::new();
@@ -517,12 +785,15 @@ mod tests {
             MessagingEndpoint::join(settings.clone(), Identity::generate(), &bad_secret).await,
             Err(Error::Unauthorized)
         ));
-        let mut bad_root = code.clone();
-        bad_root.root = Identity::generate().endpoint_id();
-        assert!(matches!(
-            MessagingEndpoint::join(settings.clone(), Identity::generate(), &bad_root).await,
-            Err(Error::InvalidSignature)
-        ));
+        let mut wrong_host = code.clone();
+        wrong_host.address.id = Identity::generate().endpoint_id();
+        let mut short_timeout = settings.clone();
+        short_timeout.handshake_timeout = Duration::from_secs(1);
+        assert!(
+            MessagingEndpoint::join(short_timeout, Identity::generate(), &wrong_host)
+                .await
+                .is_err()
+        );
         host.shutdown(ShutdownMode::Immediate).await.unwrap();
         assert!(
             MessagingEndpoint::join(settings, Identity::generate(), &code)

@@ -54,11 +54,13 @@ async fn example() -> Result<()> {
 }
 ```
 
-`JoinCode::decode` accepts only the versioned `rtn-mq://join/…` encoding. Receiving the code through a trusted channel establishes the host/root identity and grants enrollment permission. Its secret is omitted from `Debug`; calling `encode()` explicitly reveals it.
+`JoinCode::decode` accepts only the versioned `rtn-mq://join/…` encoding. Receiving the code through a trusted channel pins the host identity and grants enrollment permission. After authenticating that host, the client obtains the realm, authority key, code expiry, and its signed certificate from it. Its secret is omitted from `Debug`; calling `encode()` explicitly reveals it.
 
 `JoinOptions` controls permissions, code lifetime, certificate lifetime, restrictive certificate limits, and maximum distinct registrations. Rejoining with the same key and code recovers an existing valid certificate without consuming another use. `rejoin(&code)` requires a currently valid code for the same host and preserves the running endpoint's publisher epoch, pending message IDs, and still-authorized subscriptions.
 
 `host.revoke_join_code(code.id())` blocks future enrollment through that code. Existing certificates remain valid. `deny_certificate(id)` separately rejects an enrolled certificate, including active and retained deliveries. A joining peer cannot issue codes. The host verifies that each connecting certificate was actually registered through its join flow.
+
+Compact v3 codes take 161 characters with the standard relay URL used in the guide, or 121 with one IPv4 address, including the URI prefix. They carry the full host key and 256-bit secret; longer URLs or extra routes increase their length. Relay-backed codes need the relay for initial contact; direct-only configurations retain binary IP hints. Code versions 1 and 2 are unsupported: upgrade both sides and generate fresh codes. Rejoining preserves the authority and realm established at the first join.
 
 This is a breaking API change: raw contact invites, standalone enrollment services, externally provisioned endpoint startup, and direct-address connection methods have been removed. There are no compatibility wrappers. Rejoin uses a join code as well.
 

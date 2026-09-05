@@ -213,7 +213,7 @@ impl Authority {
         self.key.public()
     }
     pub fn trust(&self) -> Trust {
-        Trust::new(self.realm, self.public_key())
+        Trust::new(self.realm_id(), self.public_key())
     }
     pub fn issue(
         &self,
