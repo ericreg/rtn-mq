@@ -12,15 +12,15 @@ use tokio::{sync::Semaphore, task::JoinSet};
 
 type Key = (EndpointId, Id, MessageId);
 type DedupKey = (Id, MessageId);
-pub(super) struct SubscriptionState {
+pub(crate) struct SubscriptionState {
     pub rx: crate::queue::Receiver<Delivery>,
     pub ready: watch::Receiver<BTreeMap<EndpointId, Result<()>>>,
 }
-pub(super) struct ReceiptDraft {
+pub(crate) struct ReceiptDraft {
     pub id: MessageId,
     pub entries: Vec<ReceiptEntry>,
 }
-pub(super) struct Registration {
+pub(crate) struct Registration {
     pub conn: Connection,
     pub cert: Certificate,
     pub session: Id,
@@ -32,21 +32,35 @@ pub(super) struct Registration {
     pub max_topics: usize,
     pub window_secs: u64,
 }
-pub(super) struct ReceiveTicket {
+pub(crate) struct ReceiveTicket {
     pub envelope: Envelope,
     pub fingerprint: [u8; 32],
     pub permits: Vec<Permit>,
     pub metadata: Permit,
 }
-pub(super) struct DataOut {
+pub(crate) struct DataOut {
     pub key: Key,
     pub signed: Arc<[u8]>,
     pub payload: PayloadLease,
     pub _memory: Arc<Permit>,
 }
-pub(super) enum Command {
+pub(crate) enum Command {
+    IssueCode {
+        options: JoinOptions,
+        reply: oneshot::Sender<Result<JoinCode>>,
+    },
+    RevokeCode {
+        id: Id,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Enroll {
+        peer: EndpointId,
+        id: Id,
+        secret: [u8; 32],
+        reply: oneshot::Sender<Result<Certificate>>,
+    },
     Connect {
-        invite: PeerInvite,
+        address: EndpointAddr,
         reply: oneshot::Sender<Result<()>>,
     },
     Disconnect {
@@ -200,8 +214,8 @@ struct Dedup {
     state: DedupState,
     _memory: Permit,
 }
-pub(super) struct Owner {
-    config: Config,
+pub(crate) struct Owner {
+    config: EndpointConfig,
     identity: Identity,
     cert: Certificate,
     cert_updates: watch::Sender<Certificate>,
@@ -229,11 +243,12 @@ pub(super) struct Owner {
     credit_cursor: usize,
     clock_start: (u64, Instant),
     clock_failed: bool,
+    admission: crate::join::Admission,
 }
 impl Owner {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        config: Config,
+        config: EndpointConfig,
         identity: Identity,
         cert: Certificate,
         cert_updates: watch::Sender<Certificate>,
@@ -244,6 +259,7 @@ impl Owner {
         tx: mpsc::Sender<Command>,
         rx: mpsc::Receiver<Command>,
         stop: CancellationToken,
+        admission: crate::join::Admission,
     ) -> Self {
         let quota = Arc::new(Semaphore::new(config.max_peers * 2));
         Self {
@@ -275,6 +291,7 @@ impl Owner {
             credit_cursor: 0,
             clock_start: (auth::now().unwrap_or(0), Instant::now()),
             clock_failed: false,
+            admission,
         }
     }
     pub async fn run(mut self) {
@@ -347,15 +364,53 @@ impl Owner {
     }
     fn command(&mut self, command: Command) {
         match command {
-            Command::Connect { invite, reply } => {
+            Command::IssueCode { options, reply } => {
+                let result = self.local_valid().and_then(|now| {
+                    if self.drain.is_some() {
+                        return Err(Error::ShuttingDown);
+                    }
+                    self.admission.issue(
+                        options,
+                        self.endpoint.addr(),
+                        now,
+                        &self.metadata,
+                        self.config.max_topics,
+                    )
+                });
+                let _ = reply.send(result);
+            }
+            Command::RevokeCode { id, reply } => {
+                let _ = reply.send(self.admission.revoke_code(id));
+            }
+            Command::Enroll {
+                peer,
+                id,
+                secret,
+                reply,
+            } => {
+                let result = self.local_valid().and_then(|now| {
+                    if self.drain.is_some() {
+                        return Err(Error::ShuttingDown);
+                    }
+                    self.admission.enroll(
+                        peer,
+                        id,
+                        secret,
+                        now,
+                        self.cert.expires_at(),
+                        &self.config.trust,
+                        &self.metadata,
+                        self.config.max_peers,
+                    )
+                });
+                let _ = reply.send(result);
+            }
+            Command::Connect { address, reply } => {
                 let valid = self.local_valid().and_then(|_| {
                     if self.drain.is_some() {
                         return Err(Error::ShuttingDown);
                     }
-                    if invite.realm_id != self.config.trust.realm
-                        || invite.authority != self.config.trust.root
-                        || invite.address.id == self.endpoint.id()
-                    {
+                    if !self.admission.can_dial(address.id) {
                         return Err(Error::Unauthorized);
                     }
                     Ok(())
@@ -364,7 +419,7 @@ impl Owner {
                     let _ = reply.send(Err(e));
                     return;
                 }
-                if self.peers.contains_key(&invite.address.id) {
+                if self.peers.contains_key(&address.id) {
                     let _ = reply.send(Ok(()));
                     return;
                 }
@@ -382,14 +437,7 @@ impl Owner {
                             let _quota = quota;
                             let _memory = memory;
                             transport::connect(
-                                endpoint,
-                                invite.address,
-                                config,
-                                cert,
-                                tx,
-                                stop,
-                                meta,
-                                reply,
+                                endpoint, address, config, cert, tx, stop, meta, reply,
                             )
                             .await;
                         });
@@ -598,6 +646,7 @@ impl Owner {
             return Err(Error::ShuttingDown);
         }
         self.config.trust.verify(&reg.cert, peer, now)?;
+        self.admission.check(peer, &reg.cert)?;
         if let Some(existing) = self.peers.get(&peer) {
             if (existing.reg.dialer, existing.reg.nonce) <= (reg.dialer, reg.nonce) {
                 return Ok(false);
@@ -1364,6 +1413,9 @@ impl Owner {
         }
     }
     fn maintenance(&mut self) {
+        if let Ok(now) = auth::now() {
+            self.admission.prune(now);
+        }
         let now = match auth::now() {
             Ok(n) => n,
             Err(_) => {

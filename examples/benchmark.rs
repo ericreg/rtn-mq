@@ -1,6 +1,6 @@
 //! Local direct-path smoke benchmark; it is not a network capacity claim.
 use rtn_mq::*;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::time::Instant;
 
 #[tokio::main]
@@ -20,39 +20,25 @@ async fn main() -> Result<()> {
     if iterations == 0 || iterations > 10000 || fanout == 0 || fanout > 100 || size > 1024 * 1024 {
         return Err(Error::Config("benchmark limits"));
     }
-    let authority = Authority::generate();
-    let mut config = Config::new(authority.trust());
+    let mut config = Config::new();
     config.relay_mode = RelayMode::Disabled;
     config.bind_addr = Some("127.0.0.1:0".parse().unwrap());
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let key = Identity::generate();
-    let cert = authority.issue(
-        key.endpoint_id(),
+    let sender = MessagingEndpoint::host(
+        config.clone(),
+        Identity::generate(),
         vec![Permission::publish("bench")?],
-        now,
-        now + 3600,
-        CertificateLimits::default(),
-    )?;
-    let sender = MessagingEndpoint::start(config.clone(), key, cert).await?;
+    )
+    .await?;
+    let code = sender
+        .issue_join_code(JoinOptions::new(vec![Permission::subscribe("bench")?]))
+        .await?;
     let mut receivers = Vec::new();
     let mut workers = Vec::new();
     for _ in 0..fanout {
-        let key = Identity::generate();
-        let cert = authority.issue(
-            key.endpoint_id(),
-            vec![Permission::subscribe("bench")?],
-            now,
-            now + 3600,
-            CertificateLimits::default(),
-        )?;
-        let receiver = MessagingEndpoint::start(config.clone(), key, cert).await?;
+        let receiver = MessagingEndpoint::join(config.clone(), Identity::generate(), &code).await?;
         let mut subscription = receiver
             .subscribe("bench", SubscriptionOptions::default())
             .await?;
-        sender.connect(receiver.invite()).await?;
         subscription
             .wait_ready(sender.endpoint_id(), Duration::from_secs(10))
             .await?;
@@ -68,7 +54,6 @@ async fn main() -> Result<()> {
         }));
         receivers.push(receiver);
     }
-    drop(authority);
     let publisher = sender.publisher("bench")?;
     let mut latencies = Vec::with_capacity(iterations);
     let start = Instant::now();

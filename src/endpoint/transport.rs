@@ -9,11 +9,11 @@ use iroh::endpoint::{Connection, Incoming, QuicTransportConfig, RecvStream, Send
 use tokio::{task::JoinSet, time::timeout};
 const ALPN: &[u8] = b"iroh-mq/1";
 
-pub(super) async fn bind(config: &Config, identity: &Identity) -> Result<Endpoint> {
+pub(super) async fn bind(config: &EndpointConfig, identity: &Identity) -> Result<Endpoint> {
     bind_protocol(config, identity, ALPN).await
 }
 pub(crate) async fn bind_protocol(
-    config: &Config,
+    config: &EndpointConfig,
     identity: &Identity,
     alpn: &[u8],
 ) -> Result<Endpoint> {
@@ -33,7 +33,7 @@ pub(crate) async fn bind_protocol(
     };
     builder = builder
         .secret_key(identity.0.clone())
-        .alpns(vec![alpn.to_vec()])
+        .alpns(vec![alpn.to_vec(), crate::join::ALPN.to_vec()])
         .relay_mode(config.relay_mode.clone())
         .transport_config(transport);
     if config.relay_only {
@@ -54,7 +54,7 @@ impl Drop for Close {
 pub(super) async fn connect(
     endpoint: Endpoint,
     address: EndpointAddr,
-    config: Config,
+    config: EndpointConfig,
     cert: Certificate,
     tx: mpsc::Sender<Command>,
     stop: CancellationToken,
@@ -71,7 +71,7 @@ pub(super) async fn connect(
 }
 pub(super) async fn incoming(
     incoming: Incoming,
-    config: Config,
+    config: EndpointConfig,
     cert: Certificate,
     tx: mpsc::Sender<Command>,
     stop: CancellationToken,
@@ -82,7 +82,15 @@ pub(super) async fn incoming(
     };
     let connection = tokio::select! {_=stop.cancelled()=>return,r=timeout(config.handshake_timeout,accepting)=>r};
     if let Ok(Ok(conn)) = connection {
-        run(conn, false, config, cert, tx, stop, metadata, None).await;
+        if conn.alpn() == crate::join::ALPN {
+            let _close = Close(conn.clone());
+            tokio::select! {
+                _ = stop.cancelled() => {},
+                _ = timeout(config.handshake_timeout, crate::join::serve(conn, tx)) => {},
+            }
+        } else {
+            run(conn, false, config, cert, tx, stop, metadata, None).await;
+        }
     }
 }
 async fn read_small(recv: &mut RecvStream, expected: u8) -> Result<Vec<u8>> {
@@ -108,7 +116,7 @@ struct Handshake {
 async fn handshake(
     conn: &Connection,
     dialing: bool,
-    config: &Config,
+    config: &EndpointConfig,
     cert: &Certificate,
 ) -> Result<Handshake> {
     if conn.alpn() != ALPN {
@@ -178,7 +186,7 @@ async fn handshake(
 async fn run(
     conn: Connection,
     dialing: bool,
-    config: Config,
+    config: EndpointConfig,
     cert: Certificate,
     tx: mpsc::Sender<Command>,
     stop: CancellationToken,
@@ -427,38 +435,32 @@ pub(super) async fn write_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn settings() -> Config {
+        let mut c = Config::new();
+        c.relay_mode = RelayMode::Disabled;
+        c.bind_addr = Some("127.0.0.1:0".parse().unwrap());
+        c
+    }
     #[tokio::test]
-    async fn stolen_certificate_fails_the_real_mutual_handshake() {
-        let authority = Authority::generate();
-        let mut config = Config::new(authority.trust());
-        config.relay_mode = RelayMode::Disabled;
-        config.bind_addr = Some("127.0.0.1:0".parse().unwrap());
-        let server_key = Identity::generate();
-        let now = auth::now().unwrap();
-        let server_cert = authority
-            .issue(
-                server_key.endpoint_id(),
-                vec![],
-                now,
-                now + 60,
-                CertificateLimits::default(),
-            )
-            .unwrap();
-        let server = MessagingEndpoint::start(config.clone(), server_key, server_cert)
+    async fn stolen_joined_certificate_fails_the_real_mutual_handshake() {
+        let host = MessagingEndpoint::host(settings(), Identity::generate(), vec![])
             .await
             .unwrap();
-        let victim = Identity::generate();
-        let stolen = authority
-            .issue(
-                victim.endpoint_id(),
-                vec![],
-                now,
-                now + 60,
-                CertificateLimits::default(),
-            )
+        let code = host
+            .issue_join_code(JoinOptions::new(vec![]))
+            .await
             .unwrap();
+        let victim = MessagingEndpoint::join(settings(), Identity::generate(), &code)
+            .await
+            .unwrap();
+        let stolen = victim.certificate();
+        victim.shutdown(ShutdownMode::Immediate).await.unwrap();
+        let config = EndpointConfig {
+            settings: settings(),
+            trust: code.trust(),
+        };
         let thief = bind(&config, &Identity::generate()).await.unwrap();
-        let conn = thief.connect(server.invite().address, ALPN).await.unwrap();
+        let conn = thief.connect(code.address, ALPN).await.unwrap();
         assert!(
             timeout(
                 Duration::from_secs(3),
@@ -468,33 +470,15 @@ mod tests {
             .unwrap()
             .is_err()
         );
-        assert_eq!(server.metrics().await.unwrap().peers, 0);
-        conn.close(0u32.into(), b"test complete");
         thief.close().await;
-        server.shutdown(ShutdownMode::Immediate).await.unwrap();
+        host.shutdown(ShutdownMode::Immediate).await.unwrap();
     }
     #[tokio::test]
-    async fn acknowledgement_for_an_unaddressed_delivery_closes_session() {
-        let authority = Authority::generate();
-        let mut config = Config::new(authority.trust());
-        config.relay_mode = RelayMode::Disabled;
-        config.bind_addr = Some("127.0.0.1:0".parse().unwrap());
-        let now = auth::now().unwrap();
-        let akey = Identity::generate();
-        let ac = authority
-            .issue(
-                akey.endpoint_id(),
-                vec![],
-                now,
-                now + 60,
-                CertificateLimits::default(),
-            )
-            .unwrap();
-        let a = MessagingEndpoint::start(config.clone(), akey, ac)
-            .await
-            .unwrap();
+    async fn root_signed_certificate_without_join_registration_is_rejected() {
+        let root = Authority::generate();
         let key = Identity::generate();
-        let cert = authority
+        let now = auth::now().unwrap();
+        let cert = root
             .issue(
                 key.endpoint_id(),
                 vec![],
@@ -503,8 +487,63 @@ mod tests {
                 CertificateLimits::default(),
             )
             .unwrap();
-        let raw = bind(&config, &key).await.unwrap();
-        let conn = raw.connect(a.invite().address, ALPN).await.unwrap();
+        let unregistered = Identity::generate();
+        let unauthorized = root
+            .issue(
+                unregistered.endpoint_id(),
+                vec![],
+                now,
+                now + 60,
+                CertificateLimits::default(),
+            )
+            .unwrap();
+        let config = EndpointConfig {
+            settings: settings(),
+            trust: root.trust(),
+        };
+        let endpoint = bind(&config, &key).await.unwrap();
+        let host = MessagingEndpoint::start_bound(
+            config.clone(),
+            key,
+            cert,
+            endpoint,
+            crate::join::Admission::host(root),
+            None,
+        )
+        .await
+        .unwrap();
+        let raw = bind(&config, &unregistered).await.unwrap();
+        let conn = raw
+            .connect(host.handle.endpoint.addr(), ALPN)
+            .await
+            .unwrap();
+        let _ = handshake(&conn, true, &config, &unauthorized).await;
+        timeout(Duration::from_secs(3), conn.closed())
+            .await
+            .unwrap();
+        assert_eq!(host.metrics().await.unwrap().peers, 0);
+        raw.close().await;
+        host.shutdown(ShutdownMode::Immediate).await.unwrap();
+    }
+    #[tokio::test]
+    async fn acknowledgement_for_an_unaddressed_delivery_closes_joined_session() {
+        let host = MessagingEndpoint::host(settings(), Identity::generate(), vec![])
+            .await
+            .unwrap();
+        let code = host
+            .issue_join_code(JoinOptions::new(vec![]))
+            .await
+            .unwrap();
+        let config = EndpointConfig {
+            settings: settings(),
+            trust: code.trust(),
+        };
+        let raw = bind(&config, &Identity::generate()).await.unwrap();
+        let cert = crate::join::redeem(&raw, &config, &code).await.unwrap();
+        // A lost enrollment response can be recovered by the same authenticated key.
+        let recovered = crate::join::redeem(&raw, &config, &code).await.unwrap();
+        assert_eq!(cert.id(), recovered.id());
+        let conn = raw.connect(code.address, ALPN).await.unwrap();
         let mut h = handshake(&conn, true, &config, &cert).await.unwrap();
         let (kind, bytes) = Control::Outcome {
             topic: Topic::new("jobs").unwrap(),
@@ -521,6 +560,34 @@ mod tests {
             .await
             .unwrap();
         raw.close().await;
-        a.shutdown(ShutdownMode::Immediate).await.unwrap();
+        host.shutdown(ShutdownMode::Immediate).await.unwrap();
+    }
+    #[tokio::test]
+    async fn members_cannot_connect_to_other_members_without_a_host_join() {
+        let host = MessagingEndpoint::host(settings(), Identity::generate(), vec![])
+            .await
+            .unwrap();
+        let code = host
+            .issue_join_code(JoinOptions::new(vec![]))
+            .await
+            .unwrap();
+        let b = MessagingEndpoint::join(settings(), Identity::generate(), &code)
+            .await
+            .unwrap();
+        let config = EndpointConfig {
+            settings: settings(),
+            trust: code.trust(),
+        };
+        let raw = bind(&config, &Identity::generate()).await.unwrap();
+        let cert = crate::join::redeem(&raw, &config, &code).await.unwrap();
+        let conn = raw.connect(b.handle.endpoint.addr(), ALPN).await.unwrap();
+        let _ = handshake(&conn, true, &config, &cert).await;
+        timeout(Duration::from_secs(3), conn.closed())
+            .await
+            .unwrap();
+        assert_eq!(b.metrics().await.unwrap().peers, 1);
+        raw.close().await;
+        b.shutdown(ShutdownMode::Immediate).await.unwrap();
+        host.shutdown(ShutdownMode::Immediate).await.unwrap();
     }
 }

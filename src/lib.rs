@@ -3,25 +3,24 @@ mod auth;
 mod buffer;
 mod cbor;
 mod endpoint;
-mod enrollment;
 mod error;
 mod identity;
+mod join;
 mod message;
 mod queue;
 mod wire;
 
-pub use auth::{
-    Authority, Certificate, CertificateLimits, Permission, RealmId, RevocationSnapshot, Trust,
-};
+use auth::Authority;
+pub use auth::{Certificate, CertificateLimits, Permission, RealmId, RevocationSnapshot, Trust};
 pub use buffer::{BufferPool, PayloadLease};
 pub use endpoint::{
-    Config, Delivery, MessagingEndpoint, Metrics, PeerInvite, PublishOptions, Publisher, Receipt,
+    Config, Delivery, MessagingEndpoint, Metrics, PublishOptions, Publisher, Receipt,
     RecipientOutcome, ShutdownMode, Subscription, SubscriptionOptions,
 };
-pub use enrollment::{EnrollmentInvite, EnrollmentService};
 pub use error::{Error, Result};
 pub use identity::Identity;
-pub use iroh::{EndpointAddr, EndpointId, RelayMode};
+pub use iroh::{EndpointId, RelayMode};
+pub use join::{JoinCode, JoinOptions};
 pub use message::{DeliveryMode, MessageId, Nack, Topic};
 
 #[cfg(test)]

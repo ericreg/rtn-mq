@@ -1,102 +1,91 @@
 # rtn-mq
 
-An embedded Rust publish/subscribe library over Iroh. Peers exchange messages directly, using independently generated endpoint keys, root-signed topic permissions, and signed message envelopes. ESP supplied reference logic; **ESP is not a dependency or runtime requirement**.
+An embedded Rust publish/subscribe library over Iroh. **Join codes are the only public connection path.** A host creates a realm and issues reusable codes; each joining machine generates its own key, obtains a certificate, and connects to that host. ESP supplied reference logic; ESP is not a dependency or runtime requirement.
 
-The memory-only implementation includes offline provisioning, single-use network enrollment, certificate renewal and revocation, exact-topic subscriptions, per-recipient receipts, ACK/NACK retries, reconnect resumption, bounded queues, metered immutable payloads, and graceful shutdown. Direct and relay-only paths are covered by local integration tests.
-
-## Run
-
-Rust 1.96 or newer is required. Run the two-endpoint example:
+Start with [USER_GUIDE.md](USER_GUIDE.md) for the two-computer walkthrough, or run the local example:
 
 ```sh
 cargo run --locked --example direct
 ```
 
-It creates an offline authority, provisions independent publisher/subscriber keys, drops the authority, exchanges a signed message over Iroh, and reports its processing acknowledgement.
+On computer A:
 
 ```sh
-cargo test --locked --all-features --all-targets
-cargo clippy --locked --all-features --all-targets -- -D warnings
-cargo fmt --all -- --check
+cargo run --locked --example two_computers -- host
 ```
 
-For a runnable sender and receiver on separate computers, follow the [two-computer quick start](USER_GUIDE.md#send-a-message-between-two-computers) using [examples/two_computers.rs](examples/two_computers.rs). It includes one-use enrollment, CBOR message payloads, and an optional direct LAN mode.
+Share its printed code privately. On B, C, or another computer:
 
-The relay test starts its own loopback relay and disables direct IP transport. Tests do not require an ESP daemon or public relay service.
+```sh
+cargo run --locked --example two_computers -- join "PASTE_JOIN_CODE_HERE" "Hello from another computer"
+```
 
-## Use in an application
+The host keeps receiving until Ctrl+C. The code expires in one hour and admits at most 256 distinct endpoint identities by default. The example creates fresh identities on each run. There are no setup files or separate enrollment processes. The guide includes a direct LAN option.
 
-See [USER_GUIDE.md](USER_GUIDE.md) for peer provisioning, contact exchange, connections across machines, enrollment, and reconnects.
+## Library API
 
-Applications supply a Tokio runtime. See [examples/direct.rs](examples/direct.rs) for the complete setup. After starting and connecting provisioned endpoints:
+Applications supply a Tokio runtime. `Config::new()` selects Iroh's default networking. For local-only tests, disable relays and bind loopback as in [examples/direct.rs](examples/direct.rs).
 
 ```rust
-use rtn_mq::{MessagingEndpoint, PublishOptions, Result, SubscriptionOptions};
+use rtn_mq::*;
 use std::time::Duration;
 
-async fn exchange(sender: &MessagingEndpoint, receiver: &MessagingEndpoint) -> Result<()> {
-    let mut subscription = receiver
-        .subscribe("jobs", SubscriptionOptions::acknowledged())
-        .await?;
-    subscription
-        .wait_ready(sender.endpoint_id(), Duration::from_secs(5))
-        .await?;
+async fn example() -> Result<()> {
+    let host = MessagingEndpoint::host(
+        Config::new(), Identity::generate(), vec![Permission::subscribe("jobs")?],
+    ).await?;
+    let mut subscription = host.subscribe("jobs", SubscriptionOptions::acknowledged()).await?;
+    host.online(Duration::from_secs(30)).await?;
+    let code = host.issue_join_code(JoinOptions::new(vec![Permission::publish("jobs")?])).await?;
 
-    let payload = sender.buffers().from_vec(b"example job".to_vec())?;
-    let mut receipt = sender.publisher("jobs")?
-        .publish(payload, PublishOptions::default()).await?;
+    // Transfer code.encode()? privately to the joining application.
+    let peer = MessagingEndpoint::join(Config::new(), Identity::generate(), &code).await?;
+    subscription.wait_ready(peer.endpoint_id(), Duration::from_secs(5)).await?;
+    let payload = peer.buffers().from_vec(minicbor::to_vec("example job").unwrap())?;
+    let mut receipt = peer.publisher("jobs")?.publish(payload, PublishOptions::default()).await?;
     if let Some(delivery) = subscription.recv().await? {
-        // Apply the application's side effect before acknowledging.
-        println!("received {} bytes", delivery.payload().len());
+        println!("{}", minicbor::decode::<&str>(delivery.payload())?);
         delivery.ack().await?;
     }
-    let outcomes = receipt
-        .wait_for_processing(Duration::from_secs(5))
-        .await?;
-    println!("{outcomes:?}");
+    println!("{:?}", receipt.wait_for_processing(Duration::from_secs(5)).await?);
+    peer.shutdown(ShutdownMode::Immediate).await?;
+    host.shutdown(ShutdownMode::Immediate).await?;
     Ok(())
 }
 ```
 
-Wait methods (`wait_for_processing`, `wait_ready`, and `online`) accept `Duration` timeouts. Each timeout covers the whole wait; a receipt timeout does not cancel delivery. Graceful shutdown uses `ShutdownMode::Drain { timeout: Duration::from_secs(10) }`.
+`JoinCode::decode` accepts only the versioned `rtn-mq://join/…` encoding. Receiving the code through a trusted channel establishes the host/root identity and grants enrollment permission. Its secret is omitted from `Debug`; calling `encode()` explicitly reveals it.
 
-`Config::new(authority.trust())` enables Iroh's default relay and address-lookup configuration. Provision `PeerInvite` contact material through a trusted channel. `connect()` authenticates the peer; `wait_ready()` confirms a particular peer's acceptance of a subscription. Topics are case-sensitive ASCII paths, with one receive handle per topic per endpoint.
+`JoinOptions` controls permissions, code lifetime, certificate lifetime, restrictive certificate limits, and maximum distinct registrations. Rejoining with the same key and code recovers an existing valid certificate without consuming another use. `rejoin(&code)` requires a currently valid code for the same host and preserves the running endpoint's publisher epoch, pending message IDs, and still-authorized subscriptions.
 
-For network enrollment, start `EnrollmentService` with an `Authority`, a **different** transport `Identity`, and matching `Config`. `issue_invite()` fixes the permissions, certificate lifetime, invitation lifetime, and restrictive limits. Deliver the encoded `EnrollmentInvite` privately; its `redeem(&identity, &config)` method checks the pinned authority and returns a certificate bound to that identity. Concurrent redemption can authorize only one endpoint. The same endpoint can retrieve its grant again after a lost response. Invitation state is memory-only; a service restart invalidates outstanding invites.
+`host.revoke_join_code(code.id())` blocks future enrollment through that code. Existing certificates remain valid. `deny_certificate(id)` separately rejects an enrolled certificate, including active and retained deliveries. A joining peer cannot issue codes. The host verifies that each connecting certificate was actually registered through its join flow.
 
-`Identity::save` and `Identity::load` provide explicit Unix private-key storage. The parent directory must already exist with private permissions. On other platforms, supply a key through `Identity::from_secret_key` and an application-managed key store. No API reads ESP configuration.
-
-`renew(certificate)` replaces local authorization and closes old sessions. Reconnect with `connect(invite)` to exchange the new certificate; retained publications and still-authorized subscription IDs survive. Applications choose reconnect timing and refresh stale contact hints. Signed revocation snapshots enforce increasing versions and freshness in memory; applications needing restart-resistant rollback protection must persist and restore their trust state/version policy externally.
+This is a breaking API change: raw contact invites, standalone enrollment services, externally provisioned endpoint startup, and direct-address connection methods have been removed. There are no compatibility wrappers. Rejoin uses a join code as well.
 
 ## Delivery and resource behavior
 
-- `publish().await` reports local fan-out admission, not processing success. Every recipient has its own outcome. Full peers can be rejected while healthy peers continue; no eligible recipient returns `NoSubscribers`.
-- `Acknowledged` retains and retries admitted deliveries until ACK, permanent NACK, cancellation, authorization failure, or deadline. Lost ACKs regenerate from bounded deduplication state. Dropping a delivery requests retry. Application side effects should use `MessageId` for idempotency.
-- `BestEffort` reports `Sent` after the transport write completes. This does not prove remote receipt or processing. Delivery modes are explicitly matched to the subscription.
-- Cancelling a publish/receipt wait does not retract an admitted publication. `Receipt::cancel()` is explicit; it cannot undo already-delivered plaintext or application side effects.
-- Receivers grant one message slot at a time per topic/peer binding, on demand. Grants reserve bytes against shared subscription and endpoint budgets. A cloned `PayloadLease` retains its reservation after ACK until the final clone drops.
-- Buffer charges include allocation capacity and a conservative 256-byte ownership allowance. Incoming grants reserve the negotiated maximum payload plus that allowance. Metadata charges include queue storage, certificates, pending/terminal receipts, and deduplication records. `Metrics` reports charged bytes and high-water marks, not process RSS.
-- Deduplication history remains charged through the message lifetime; terminal receipt history adds one handshake-timeout grace period for late acknowledgements. Exhaustion produces explicit backpressure rather than evicting live replay state. There is no durable inbox/outbox, offline history replay, broker, forwarding, wildcard subscription, or exactly-once guarantee.
+- CBOR via `minicbor` is the serialization format; signatures use COSE/CBOR. Applications define and validate their payload schemas over immutable leased bytes.
+- Publication snapshots currently connected, authorized subscriptions. Receipts expose per-recipient admission and processing outcomes. `NoSubscribers` means nothing was admitted.
+- Acknowledged messages retry within their lifetime. ACK follows application processing; dropped deliveries request retry. Use `MessageId` for idempotent application side effects. Best-effort `Sent` means the transport write completed.
+- `wait_ready`, `wait_for_processing`, and `online` accept `Duration`. Each call has one total timeout budget. A receipt timeout does not cancel delivery; `receipt.cancel()` is explicit.
+- Payload leases share storage and retain their byte/slot charges until the final clone drops, independently of ACK. Receiver credits reserve payload and deduplication capacity before advertising admission.
+- Join codes, cached grants, issued membership records, certificates, queues, and delivery history are bounded and metered. Disconnecting does not discard unexpired membership or pending-delivery charges. Metrics report library charges and high-water marks, not process RSS.
+- Shutdown uses `Immediate` or `Drain { timeout: Duration }`. Drain reports unfinished deliveries when its budget expires.
 
-The endpoint owner serializes mutable routing/delivery state. `rtrb` SPSC rings serve topic writers and subscription receivers; ingress and session events use bounded Tokio MPSC channels. Ring operations are nonblocking; async notifications and the complete network pipeline do not have a blanket lock-free guarantee. This crate forbids its own unsafe Rust.
+Only host-to-joined-peer connections are supported. There is no peer discovery, membership directory, forwarding, or automatic B-to-C connection. No broker routes messages between joined peers.
 
-CBOR is the library's serialization format, implemented with `minicbor`; signed certificates and message envelopes use COSE/CBOR. For structured application payloads, encode CBOR into a buffer lease and decode from `delivery.payload()` or `PayloadLease::as_bytes()`. The payload API exposes bytes, so applications define and validate their own payload schemas.
+Host authority keys, join-code state, certificates, queues, and replay state are in memory. Restarting a host creates a new realm and invalidates its old codes. Host certificates last 24 hours; issued certificates cannot outlive them. Restart/re-enroll for a new host lifetime. Applications may persist endpoint identities with `Identity::save`/`load` on Unix, but this does not persist host membership or message state. Durability and io_uring remain optional future work.
 
-## Protocol and measurements
-
-The complete architecture, concrete CBOR/COSE profile, resource defaults, ESP source map, and remaining optional extensions are in [ARCHITECTURE.md](ARCHITECTURE.md). Independent Python CBOR/Ed25519 fixtures are checked into `tests/fixtures`; regenerate them with:
+## Validate and measure
 
 ```sh
+cargo test --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+cargo fmt --all -- --check
 uv run --with cbor2 --with cryptography tools/generate_fixtures.py
-```
-
-A configurable local benchmark measures publish-to-processing-ACK latency and delivery throughput:
-
-```sh
-# iterations, fan-out, payload bytes
 cargo run --locked --release --example benchmark -- 20 10 1024
 ```
 
-The checked-in [smoke results](benchmarks/smoke.csv) and [environment](benchmarks/environment.txt) cover fan-out of 1, 10, and 100 for payloads from 128 bytes to 1 MiB. Regenerate the matrix with `python3 tools/run_smoke_benchmarks.py`.
+Tests include concurrent reusable-code admission, limits, code/member revocation, same-key response recovery, forged/stolen/unregistered certificate rejection, relay-only enrollment and delivery, retries, reconnects, memory bounds, and shutdown. The relay test runs a loopback relay and disables direct transports.
 
-The benchmark includes signing, verification, payload hashing, credits, and application ACKs. Its CSV output describes a local direct-path smoke run, not WAN performance or a capacity promise. Durability, io_uring storage, a reusable allocation pool, and broader performance/concurrency-model studies remain extensions beyond this baseline.
+The benchmark enrolls each recipient through a join code before timing delivery. [Smoke results](benchmarks/smoke.csv) and their [environment](benchmarks/environment.txt) cover fan-out 1/10/100 and payloads 128 bytes–1 MiB. Regenerate with `python3 tools/run_smoke_benchmarks.py`. These are small loopback smoke measurements, not WAN capacity claims. See [ARCHITECTURE.md](ARCHITECTURE.md) for protocol details and the ESP logic source map.

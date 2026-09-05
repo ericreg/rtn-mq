@@ -1,5 +1,5 @@
 use crate::{
-    Error, Identity, Result, Topic,
+    Error, Result, Topic,
     cbor::{Reader, Writer, canonical},
 };
 use iroh::{EndpointId, SecretKey, Signature};
@@ -199,7 +199,8 @@ impl Authority {
             realm: rand::random(),
         }
     }
-    pub fn from_identity(identity: Identity, realm: RealmId) -> Self {
+    #[cfg(test)]
+    pub fn from_identity(identity: crate::Identity, realm: RealmId) -> Self {
         Self {
             key: identity.0,
             realm,
@@ -237,6 +238,7 @@ impl Authority {
         let bytes = sign_cose(&c.encode(), &self.key, CERT_CONTEXT);
         Certificate::from_bytes(&bytes)
     }
+    #[cfg(test)]
     pub fn revocations(
         &self,
         version: u64,
@@ -468,6 +470,7 @@ pub(crate) fn now() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Identity;
     fn certificate() -> (Authority, Identity, Certificate) {
         let a = Authority::generate();
         let i = Identity::generate();

@@ -1,17 +1,11 @@
 use rtn_mq::*;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::time::timeout;
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-}
 fn wait_timeout() -> Duration {
     Duration::from_secs(5)
 }
-fn config(authority: &Authority) -> Config {
-    let mut c = Config::new(authority.trust());
+fn config() -> Config {
+    let mut c = Config::new();
     c.relay_mode = RelayMode::Disabled;
     c.bind_addr = Some("127.0.0.1:0".parse().unwrap());
     c.max_payload = 256;
@@ -24,22 +18,32 @@ fn config(authority: &Authority) -> Config {
     c.handshake_timeout = Duration::from_secs(3);
     c
 }
-async fn start(
-    authority: &Authority,
+async fn host(permissions: Vec<Permission>, config: Config) -> MessagingEndpoint {
+    MessagingEndpoint::host(config, Identity::generate(), permissions)
+        .await
+        .unwrap()
+}
+async fn member(
+    host: &MessagingEndpoint,
     permissions: Vec<Permission>,
-    c: Config,
+    config: Config,
 ) -> MessagingEndpoint {
-    let identity = Identity::generate();
-    let cert = authority
-        .issue(
-            identity.endpoint_id(),
-            permissions,
-            now() - 1,
-            now() + 60,
-            CertificateLimits::default(),
-        )
+    let code = host
+        .issue_join_code(JoinOptions::new(permissions))
+        .await
         .unwrap();
-    MessagingEndpoint::start(c, identity, cert).await.unwrap()
+    MessagingEndpoint::join(config, Identity::generate(), &code)
+        .await
+        .unwrap()
+}
+async fn reconnect(host: &MessagingEndpoint, client: &MessagingEndpoint) {
+    let code = host
+        .issue_join_code(JoinOptions::new(
+            client.certificate().permissions().to_vec(),
+        ))
+        .await
+        .unwrap();
+    client.rejoin(&code).await.unwrap();
 }
 fn options() -> PublishOptions {
     PublishOptions {
@@ -55,24 +59,12 @@ async fn delivery(s: &mut Subscription) -> Delivery {
         .unwrap()
 }
 async fn pair() -> (MessagingEndpoint, MessagingEndpoint, Subscription) {
-    let authority = Authority::generate();
-    let a = start(
-        &authority,
-        vec![Permission::publish("jobs").unwrap()],
-        config(&authority),
-    )
-    .await;
-    let b = start(
-        &authority,
-        vec![Permission::subscribe("jobs").unwrap()],
-        config(&authority),
-    )
-    .await;
+    let a = host(vec![Permission::publish("jobs").unwrap()], config()).await;
+    let b = member(&a, vec![Permission::subscribe("jobs").unwrap()], config()).await;
     let mut sub = b
         .subscribe("jobs", SubscriptionOptions::acknowledged())
         .await
         .unwrap();
-    a.connect(b.invite()).await.unwrap();
     sub.wait_ready(a.endpoint_id(), wait_timeout())
         .await
         .unwrap();
@@ -103,15 +95,10 @@ async fn direct_signed_delivery_and_processing_receipt() {
     );
     close(&a, &b).await;
 }
+
 #[tokio::test]
 async fn no_subscribers_and_duplicate_local_subscription_are_explicit() {
-    let authority = Authority::generate();
-    let a = start(
-        &authority,
-        vec![Permission::both("jobs").unwrap()],
-        config(&authority),
-    )
-    .await;
+    let a = host(vec![Permission::both("jobs").unwrap()], config()).await;
     assert!(matches!(
         a.publisher("jobs")
             .unwrap()
@@ -130,6 +117,7 @@ async fn no_subscribers_and_duplicate_local_subscription_are_explicit() {
     assert!(matches!(a.publisher("Jobs"), Err(Error::Unauthorized)));
     a.shutdown(ShutdownMode::Immediate).await.unwrap();
 }
+
 #[tokio::test]
 async fn retryable_nack_and_abandonment_keep_message_identity() {
     let (a, b, mut sub) = pair().await;
@@ -155,6 +143,7 @@ async fn retryable_nack_and_abandonment_keep_message_identity() {
     assert!(a.metrics().await.unwrap().retried >= 2);
     close(&a, &b).await;
 }
+
 #[tokio::test]
 async fn permanent_nack_is_terminal() {
     let (a, b, mut sub) = pair().await;
@@ -175,24 +164,18 @@ async fn permanent_nack_is_terminal() {
     );
     close(&a, &b).await;
 }
+
 #[tokio::test]
 async fn held_payload_lease_retains_credit_after_ack() {
-    let authority = Authority::generate();
-    let a = start(
-        &authority,
-        vec![Permission::publish("jobs").unwrap()],
-        config(&authority),
-    )
-    .await;
-    let mut c = config(&authority);
+    let a = host(vec![Permission::publish("jobs").unwrap()], config()).await;
+    let mut c = config();
     c.subscription_messages = 1;
     c.payload_bytes = 512;
-    let b = start(&authority, vec![Permission::subscribe("jobs").unwrap()], c).await;
+    let b = member(&a, vec![Permission::subscribe("jobs").unwrap()], c).await;
     let mut sub = b
         .subscribe("jobs", SubscriptionOptions::default())
         .await
         .unwrap();
-    a.connect(b.invite()).await.unwrap();
     sub.wait_ready(a.endpoint_id(), wait_timeout())
         .await
         .unwrap();
@@ -221,6 +204,7 @@ async fn held_payload_lease_retains_credit_after_ack() {
     second.wait_for_processing(wait_timeout()).await.unwrap();
     close(&a, &b).await;
 }
+
 #[tokio::test]
 async fn reconnect_regenerates_lost_ack_without_redelivery() {
     let (a, b, mut sub) = pair().await;
@@ -240,7 +224,7 @@ async fn reconnect_regenerates_lost_ack_without_redelivery() {
     .await
     .unwrap();
     d.ack().await.unwrap();
-    a.connect(b.invite()).await.unwrap();
+    reconnect(&a, &b).await;
     sub.wait_ready(a.endpoint_id(), wait_timeout())
         .await
         .unwrap();
@@ -255,24 +239,14 @@ async fn reconnect_regenerates_lost_ack_without_redelivery() {
     );
     close(&a, &b).await;
 }
+
 #[tokio::test]
 async fn three_peers_and_partial_fanout_admission() {
-    let authority = Authority::generate();
-    let mut c = config(&authority);
+    let mut c = config();
     c.per_peer_messages = 1;
-    let a = start(&authority, vec![Permission::publish("jobs").unwrap()], c).await;
-    let b = start(
-        &authority,
-        vec![Permission::subscribe("jobs").unwrap()],
-        config(&authority),
-    )
-    .await;
-    let c = start(
-        &authority,
-        vec![Permission::subscribe("jobs").unwrap()],
-        config(&authority),
-    )
-    .await;
+    let a = host(vec![Permission::publish("jobs").unwrap()], c).await;
+    let b = member(&a, vec![Permission::subscribe("jobs").unwrap()], config()).await;
+    let c = member(&a, vec![Permission::subscribe("jobs").unwrap()], config()).await;
     let mut bs = b
         .subscribe("jobs", SubscriptionOptions::default())
         .await
@@ -281,8 +255,6 @@ async fn three_peers_and_partial_fanout_admission() {
         .subscribe("jobs", SubscriptionOptions::default())
         .await
         .unwrap();
-    a.connect(b.invite()).await.unwrap();
-    a.connect(c.invite()).await.unwrap();
     bs.wait_ready(a.endpoint_id(), wait_timeout())
         .await
         .unwrap();
@@ -322,6 +294,7 @@ async fn three_peers_and_partial_fanout_admission() {
     close(&a, &b).await;
     c.shutdown(ShutdownMode::Immediate).await.unwrap();
 }
+
 #[tokio::test]
 async fn deadline_and_cancellation_are_visible() {
     let (a, b, mut sub) = pair().await;
@@ -353,26 +326,20 @@ async fn deadline_and_cancellation_are_visible() {
     );
     close(&a, &b).await;
 }
+
 #[tokio::test]
-async fn simultaneous_dials_converge_and_best_effort_is_explicit() {
-    let authority = Authority::generate();
-    let a = start(
-        &authority,
-        vec![Permission::both("jobs").unwrap()],
-        config(&authority),
-    )
-    .await;
-    let b = start(
-        &authority,
-        vec![Permission::both("jobs").unwrap()],
-        config(&authority),
-    )
-    .await;
+async fn concurrent_rejoins_converge_and_best_effort_is_explicit() {
+    let a = host(vec![Permission::both("jobs").unwrap()], config()).await;
+    let b = member(&a, vec![Permission::both("jobs").unwrap()], config()).await;
     let mut sub = b
         .subscribe("jobs", SubscriptionOptions::best_effort())
         .await
         .unwrap();
-    let (ar, br) = tokio::join!(a.connect(b.invite()), b.connect(a.invite()));
+    let code = a
+        .issue_join_code(JoinOptions::new(vec![Permission::both("jobs").unwrap()]))
+        .await
+        .unwrap();
+    let (ar, br) = tokio::join!(b.rejoin(&code), b.rejoin(&code));
     ar.unwrap();
     br.unwrap();
     sub.wait_ready(a.endpoint_id(), wait_timeout())
@@ -400,126 +367,18 @@ async fn simultaneous_dials_converge_and_best_effort_is_explicit() {
     assert_eq!(b.metrics().await.unwrap().peers, 1);
     close(&a, &b).await;
 }
-#[tokio::test]
-async fn certificate_expiry_closes_active_session() {
-    let authority = Authority::generate();
-    let a = start(
-        &authority,
-        vec![Permission::publish("jobs").unwrap()],
-        config(&authority),
-    )
-    .await;
-    let identity = Identity::generate();
-    let cert = authority
-        .issue(
-            identity.endpoint_id(),
-            vec![Permission::subscribe("jobs").unwrap()],
-            now() - 1,
-            now() + 2,
-            CertificateLimits::default(),
-        )
-        .unwrap();
-    let b = MessagingEndpoint::start(config(&authority), identity, cert)
-        .await
-        .unwrap();
-    a.connect(b.invite()).await.unwrap();
-    timeout(Duration::from_secs(4), async {
-        while a.metrics().await.unwrap().peers != 0 {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-        }
-    })
-    .await
-    .unwrap();
-    close(&a, &b).await;
-}
-#[tokio::test]
-async fn wrong_root_and_stolen_certificate_are_rejected() {
-    let authority = Authority::generate();
-    let identity = Identity::generate();
-    let cert = authority
-        .issue(
-            identity.endpoint_id(),
-            vec![],
-            now() - 1,
-            now() + 60,
-            CertificateLimits::default(),
-        )
-        .unwrap();
-    assert!(matches!(
-        MessagingEndpoint::start(config(&authority), Identity::generate(), cert.clone()).await,
-        Err(Error::Unauthorized)
-    ));
-    let wrong = Authority::generate();
-    assert!(matches!(
-        MessagingEndpoint::start(config(&wrong), identity, cert).await,
-        Err(Error::InvalidSignature)
-    ));
-}
 
 #[tokio::test]
-async fn revocation_fails_pending_delivery_even_while_disconnected() {
-    let authority = Authority::generate();
-    let a = start(
-        &authority,
-        vec![Permission::publish("jobs").unwrap()],
-        config(&authority),
-    )
-    .await;
-    let key = Identity::generate();
-    let cert = authority
-        .issue(
-            key.endpoint_id(),
-            vec![Permission::subscribe("jobs").unwrap()],
-            now() - 1,
-            now() + 60,
-            CertificateLimits::default(),
-        )
-        .unwrap();
-    let id = cert.id();
-    let b = MessagingEndpoint::start(config(&authority), key, cert)
-        .await
-        .unwrap();
-    let mut sub = b
-        .subscribe("jobs", SubscriptionOptions::default())
-        .await
-        .unwrap();
-    a.connect(b.invite()).await.unwrap();
-    sub.wait_ready(a.endpoint_id(), wait_timeout())
-        .await
-        .unwrap();
-    let mut r = a
-        .publisher("jobs")
-        .unwrap()
-        .publish(a.buffers().copy_from_slice(b"pending").unwrap(), options())
-        .await
-        .unwrap();
-    let d = delivery(&mut sub).await;
-    a.disconnect(b.endpoint_id()).await.unwrap();
-    a.deny_certificate(id).await.unwrap();
-    assert_eq!(
-        r.wait_for_processing(wait_timeout()).await.unwrap()[0].1,
-        RecipientOutcome::Failed(Error::Unauthorized)
-    );
-    drop(d);
-    close(&a, &b).await;
-}
-#[tokio::test]
 async fn reconnect_preserves_outbound_budget() {
-    let authority = Authority::generate();
-    let mut ac = config(&authority);
+    let mut ac = config();
     ac.per_peer_messages = 1;
-    let a = start(&authority, vec![Permission::publish("jobs").unwrap()], ac).await;
-    let b = start(
-        &authority,
-        vec![Permission::subscribe("jobs").unwrap()],
-        config(&authority),
-    )
-    .await;
+    let a = host(vec![Permission::publish("jobs").unwrap()], ac).await;
+    let b = member(&a, vec![Permission::subscribe("jobs").unwrap()], config()).await;
     let mut sub = b
         .subscribe("jobs", SubscriptionOptions::default())
         .await
         .unwrap();
-    a.connect(b.invite()).await.unwrap();
+    reconnect(&a, &b).await;
     sub.wait_ready(a.endpoint_id(), wait_timeout())
         .await
         .unwrap();
@@ -530,7 +389,7 @@ async fn reconnect_preserves_outbound_budget() {
         .unwrap();
     let held = delivery(&mut sub).await;
     a.disconnect(b.endpoint_id()).await.unwrap();
-    a.connect(b.invite()).await.unwrap();
+    reconnect(&a, &b).await;
     sub.wait_ready(a.endpoint_id(), wait_timeout())
         .await
         .unwrap();
@@ -546,268 +405,7 @@ async fn reconnect_preserves_outbound_budget() {
     first.wait_for_processing(wait_timeout()).await.unwrap();
     close(&a, &b).await;
 }
-#[tokio::test]
-async fn single_use_enrollment_and_same_key_response_recovery() {
-    let authority = Authority::generate();
-    let c = config(&authority);
-    let service = EnrollmentService::start(authority, Identity::generate(), c.clone())
-        .await
-        .unwrap();
-    let invite = service
-        .issue_invite(
-            vec![Permission::both("jobs").unwrap()],
-            CertificateLimits::default(),
-            Duration::from_secs(60),
-            Duration::from_secs(30),
-        )
-        .await
-        .unwrap();
-    let encoded = invite.encode().unwrap();
-    let invite = EnrollmentInvite::decode(&encoded).unwrap();
-    assert!(!format!("{invite:?}").contains(&encoded));
-    let one = Identity::generate();
-    let two = Identity::generate();
-    let (a, b) = tokio::join!(invite.redeem(&one, &c), invite.redeem(&two, &c));
-    assert_ne!(a.is_ok(), b.is_ok());
-    let (winner, cert) = if let Ok(cert) = a {
-        (one, cert)
-    } else {
-        (two, b.unwrap())
-    };
-    assert_eq!(
-        invite.redeem(&winner, &c).await.unwrap().as_bytes(),
-        cert.as_bytes()
-    );
-    let other_invite = service
-        .issue_invite(
-            vec![Permission::both("jobs").unwrap()],
-            CertificateLimits::default(),
-            Duration::from_secs(60),
-            Duration::from_secs(30),
-        )
-        .await
-        .unwrap();
-    let other = Identity::generate();
-    let other_cert = other_invite.redeem(&other, &c).await.unwrap();
-    service.shutdown().await.unwrap();
-    let a = MessagingEndpoint::start(c.clone(), winner, cert)
-        .await
-        .unwrap();
-    let b = MessagingEndpoint::start(c, other, other_cert)
-        .await
-        .unwrap();
-    let mut sub = b
-        .subscribe("jobs", SubscriptionOptions::default())
-        .await
-        .unwrap();
-    a.connect(b.invite()).await.unwrap();
-    sub.wait_ready(a.endpoint_id(), wait_timeout())
-        .await
-        .unwrap();
-    let mut r = a
-        .publisher("jobs")
-        .unwrap()
-        .publish(a.buffers().copy_from_slice(b"enrolled").unwrap(), options())
-        .await
-        .unwrap();
-    delivery(&mut sub).await.ack().await.unwrap();
-    r.wait_for_processing(wait_timeout()).await.unwrap();
-    close(&a, &b).await;
-}
-#[tokio::test]
-async fn relay_only_delivery_with_two_then_three_peers() {
-    use iroh_relay::server::{RelayConfig, Server, ServerConfig};
-    let mut server_config = ServerConfig::default();
-    server_config.relay = Some(RelayConfig::new(
-        "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
-    ));
-    let server = Server::spawn(server_config).await.unwrap();
-    let url = format!("http://{}", server.http_addr().unwrap())
-        .parse()
-        .unwrap();
-    let authority = Authority::generate();
-    let mut c = config(&authority);
-    c.relay_mode = RelayMode::custom([url]);
-    c.relay_only = true;
-    c.handshake_timeout = Duration::from_secs(5);
-    let a = start(
-        &authority,
-        vec![Permission::publish("jobs").unwrap()],
-        c.clone(),
-    )
-    .await;
-    let b = start(
-        &authority,
-        vec![Permission::subscribe("jobs").unwrap()],
-        c.clone(),
-    )
-    .await;
-    let third = start(&authority, vec![Permission::subscribe("jobs").unwrap()], c).await;
-    let (ar, br, cr) = tokio::join!(
-        a.online(wait_timeout()),
-        b.online(wait_timeout()),
-        third.online(wait_timeout())
-    );
-    ar.unwrap();
-    br.unwrap();
-    cr.unwrap();
-    assert_eq!(a.invite().address.ip_addrs().count(), 0);
-    assert_eq!(b.invite().address.ip_addrs().count(), 0);
-    assert_eq!(third.invite().address.ip_addrs().count(), 0);
-    let mut bs = b
-        .subscribe("jobs", SubscriptionOptions::default())
-        .await
-        .unwrap();
-    let mut cs = third
-        .subscribe("jobs", SubscriptionOptions::default())
-        .await
-        .unwrap();
-    a.connect(b.invite()).await.unwrap();
-    bs.wait_ready(a.endpoint_id(), wait_timeout())
-        .await
-        .unwrap();
-    let publisher = a.publisher("jobs").unwrap();
-    let mut first = publisher
-        .publish(
-            a.buffers().copy_from_slice(b"two relayed peers").unwrap(),
-            options(),
-        )
-        .await
-        .unwrap();
-    delivery(&mut bs).await.ack().await.unwrap();
-    first.wait_for_processing(wait_timeout()).await.unwrap();
-    a.connect(third.invite()).await.unwrap();
-    cs.wait_ready(a.endpoint_id(), wait_timeout())
-        .await
-        .unwrap();
-    let mut second = publisher
-        .publish(
-            a.buffers().copy_from_slice(b"three relayed peers").unwrap(),
-            options(),
-        )
-        .await
-        .unwrap();
-    delivery(&mut bs).await.ack().await.unwrap();
-    delivery(&mut cs).await.ack().await.unwrap();
-    assert_eq!(
-        second
-            .wait_for_processing(wait_timeout())
-            .await
-            .unwrap()
-            .len(),
-        2
-    );
-    close(&a, &b).await;
-    third.shutdown(ShutdownMode::Immediate).await.unwrap();
-    server.shutdown().await.unwrap();
-}
 
-#[tokio::test]
-async fn renewal_keeps_pending_message_identity_and_subscription() {
-    let authority = Authority::generate();
-    let identity = Identity::generate();
-    let cert = authority
-        .issue(
-            identity.endpoint_id(),
-            vec![Permission::publish("jobs").unwrap()],
-            now() - 1,
-            now() + 60,
-            CertificateLimits::default(),
-        )
-        .unwrap();
-    let a = MessagingEndpoint::start(config(&authority), identity.clone(), cert)
-        .await
-        .unwrap();
-    let b = start(
-        &authority,
-        vec![Permission::subscribe("jobs").unwrap()],
-        config(&authority),
-    )
-    .await;
-    let mut sub = b
-        .subscribe("jobs", SubscriptionOptions::default())
-        .await
-        .unwrap();
-    a.connect(b.invite()).await.unwrap();
-    sub.wait_ready(a.endpoint_id(), wait_timeout())
-        .await
-        .unwrap();
-    let mut receipt = a
-        .publisher("jobs")
-        .unwrap()
-        .publish(a.buffers().copy_from_slice(b"renew").unwrap(), options())
-        .await
-        .unwrap();
-    let held = delivery(&mut sub).await;
-    let id = held.message_id.clone();
-    let renewed = authority
-        .issue(
-            identity.endpoint_id(),
-            vec![Permission::publish("jobs").unwrap()],
-            now() - 1,
-            now() + 120,
-            CertificateLimits::default(),
-        )
-        .unwrap();
-    a.renew(renewed).await.unwrap();
-    a.connect(b.invite()).await.unwrap();
-    sub.wait_ready(a.endpoint_id(), wait_timeout())
-        .await
-        .unwrap();
-    held.ack().await.unwrap();
-    assert_eq!(
-        receipt.wait_for_processing(wait_timeout()).await.unwrap()[0].1,
-        RecipientOutcome::Processed
-    );
-    assert_eq!(receipt.message_id, id);
-    close(&a, &b).await;
-}
-#[tokio::test]
-async fn idle_publishers_do_not_reserve_another_publishers_receive_capacity() {
-    let authority = Authority::generate();
-    let idle = start(
-        &authority,
-        vec![Permission::publish("jobs").unwrap()],
-        config(&authority),
-    )
-    .await;
-    let active = start(
-        &authority,
-        vec![Permission::publish("jobs").unwrap()],
-        config(&authority),
-    )
-    .await;
-    let mut c = config(&authority);
-    c.payload_bytes = 512;
-    c.subscription_messages = 1;
-    let receiver = start(&authority, vec![Permission::subscribe("jobs").unwrap()], c).await;
-    let mut sub = receiver
-        .subscribe("jobs", SubscriptionOptions::default())
-        .await
-        .unwrap();
-    idle.connect(receiver.invite()).await.unwrap();
-    sub.wait_ready(idle.endpoint_id(), wait_timeout())
-        .await
-        .unwrap();
-    active.connect(receiver.invite()).await.unwrap();
-    sub.wait_ready(active.endpoint_id(), wait_timeout())
-        .await
-        .unwrap();
-    assert_eq!(receiver.metrics().await.unwrap().outstanding_credits, 0);
-    let mut r = active
-        .publisher("jobs")
-        .unwrap()
-        .publish(
-            active.buffers().copy_from_slice(b"active").unwrap(),
-            options(),
-        )
-        .await
-        .unwrap();
-    delivery(&mut sub).await.ack().await.unwrap();
-    r.wait_for_processing(wait_timeout()).await.unwrap();
-    close(&idle, &receiver).await;
-    active.shutdown(ShutdownMode::Immediate).await.unwrap();
-}
 #[tokio::test]
 async fn shutdown_deadline_reports_unfinished_processing() {
     let (a, b, mut sub) = pair().await;
@@ -835,26 +433,20 @@ async fn shutdown_deadline_reports_unfinished_processing() {
     drop(held);
     b.shutdown(ShutdownMode::Immediate).await.unwrap();
 }
+
 #[tokio::test]
 async fn unauthorized_remote_subscription_is_rejected_at_readiness() {
-    let authority = Authority::generate();
-    let a = start(
-        &authority,
-        vec![Permission::publish("jobs").unwrap()],
-        config(&authority),
-    )
-    .await;
-    let b = start(
-        &authority,
+    let a = host(vec![Permission::publish("jobs").unwrap()], config()).await;
+    let b = member(
+        &a,
         vec![Permission::subscribe("private").unwrap()],
-        config(&authority),
+        config(),
     )
     .await;
     let mut sub = b
         .subscribe("private", SubscriptionOptions::default())
         .await
         .unwrap();
-    a.connect(b.invite()).await.unwrap();
     assert_eq!(
         sub.wait_ready(a.endpoint_id(), wait_timeout()).await,
         Err(Error::Unauthorized)
@@ -864,7 +456,6 @@ async fn unauthorized_remote_subscription_is_rejected_at_readiness() {
 
 #[tokio::test]
 async fn subscription_churn_preserves_other_topic_streams() {
-    let authority = Authority::generate();
     let topics: Vec<_> = std::iter::once("stable".to_owned())
         .chain((0..6).map(|i| format!("temporary/{i}")))
         .collect();
@@ -872,15 +463,14 @@ async fn subscription_churn_preserves_other_topic_streams() {
         .iter()
         .map(|t| Permission::both(t).unwrap())
         .collect::<Vec<_>>();
-    let a = start(&authority, permissions.clone(), config(&authority)).await;
-    let mut receiver_config = config(&authority);
+    let a = host(permissions.clone(), config()).await;
+    let mut receiver_config = config();
     receiver_config.max_topics = 2;
-    let b = start(&authority, permissions, receiver_config).await;
+    let b = member(&a, permissions, receiver_config).await;
     let mut stable = b
         .subscribe("stable", SubscriptionOptions::acknowledged())
         .await
         .unwrap();
-    a.connect(b.invite()).await.unwrap();
     stable
         .wait_ready(a.endpoint_id(), wait_timeout())
         .await
@@ -984,25 +574,9 @@ async fn duration_waits_timeout_without_cancelling_delivery() {
 
 #[tokio::test]
 async fn processing_timeout_is_shared_by_all_recipients() {
-    let authority = Authority::generate();
-    let a = start(
-        &authority,
-        vec![Permission::publish("jobs").unwrap()],
-        config(&authority),
-    )
-    .await;
-    let b = start(
-        &authority,
-        vec![Permission::subscribe("jobs").unwrap()],
-        config(&authority),
-    )
-    .await;
-    let c = start(
-        &authority,
-        vec![Permission::subscribe("jobs").unwrap()],
-        config(&authority),
-    )
-    .await;
+    let a = host(vec![Permission::publish("jobs").unwrap()], config()).await;
+    let b = member(&a, vec![Permission::subscribe("jobs").unwrap()], config()).await;
+    let c = member(&a, vec![Permission::subscribe("jobs").unwrap()], config()).await;
     let mut bs = b
         .subscribe("jobs", SubscriptionOptions::acknowledged())
         .await
@@ -1011,8 +585,6 @@ async fn processing_timeout_is_shared_by_all_recipients() {
         .subscribe("jobs", SubscriptionOptions::acknowledged())
         .await
         .unwrap();
-    a.connect(b.invite()).await.unwrap();
-    a.connect(c.invite()).await.unwrap();
     bs.wait_ready(a.endpoint_id(), wait_timeout())
         .await
         .unwrap();
@@ -1060,4 +632,337 @@ async fn processing_timeout_is_shared_by_all_recipients() {
     );
     close(&a, &b).await;
     c.shutdown(ShutdownMode::Immediate).await.unwrap();
+}
+
+#[tokio::test]
+async fn reusable_code_admits_concurrent_members_with_a_shared_limit() {
+    let a = host(vec![Permission::both("jobs").unwrap()], config()).await;
+    let mut opts = JoinOptions::new(vec![Permission::both("jobs").unwrap()]);
+    opts.max_uses = 2;
+    let code = a.issue_join_code(opts).await.unwrap();
+    let code = JoinCode::decode(&code.encode().unwrap()).unwrap();
+    let (b, c) = tokio::join!(
+        MessagingEndpoint::join(config(), Identity::generate(), &code),
+        MessagingEndpoint::join(config(), Identity::generate(), &code),
+    );
+    let b = b.unwrap();
+    let c = c.unwrap();
+    assert_ne!(b.certificate().id(), c.certificate().id());
+    assert_ne!(b.endpoint_id(), c.endpoint_id());
+    let mut ready = a
+        .subscribe("jobs", SubscriptionOptions::acknowledged())
+        .await
+        .unwrap();
+    ready
+        .wait_ready(b.endpoint_id(), wait_timeout())
+        .await
+        .unwrap();
+    ready
+        .wait_ready(c.endpoint_id(), wait_timeout())
+        .await
+        .unwrap();
+    assert_eq!(a.metrics().await.unwrap().peers, 2);
+    assert_eq!(b.metrics().await.unwrap().peers, 1);
+    assert_eq!(c.metrics().await.unwrap().peers, 1);
+    assert!(matches!(
+        MessagingEndpoint::join(config(), Identity::generate(), &code).await,
+        Err(Error::QueueFull)
+    ));
+    let cert = b.certificate().id();
+    b.rejoin(&code).await.unwrap();
+    assert_eq!(cert, b.certificate().id());
+    assert!(matches!(
+        b.issue_join_code(JoinOptions::new(vec![])).await,
+        Err(Error::Unauthorized)
+    ));
+    close(&a, &b).await;
+    c.shutdown(ShutdownMode::Immediate).await.unwrap();
+}
+
+#[tokio::test]
+async fn revoked_code_blocks_enrollment_but_keeps_admitted_peer_authorized() {
+    let a = host(vec![Permission::subscribe("jobs").unwrap()], config()).await;
+    let code = a
+        .issue_join_code(JoinOptions::new(vec![Permission::publish("jobs").unwrap()]))
+        .await
+        .unwrap();
+    let b = MessagingEndpoint::join(config(), Identity::generate(), &code)
+        .await
+        .unwrap();
+    a.revoke_join_code(code.id()).await.unwrap();
+    assert!(matches!(
+        MessagingEndpoint::join(config(), Identity::generate(), &code).await,
+        Err(Error::Unauthorized)
+    ));
+    assert_eq!(b.rejoin(&code).await, Err(Error::Unauthorized));
+    let mut sub = a
+        .subscribe("jobs", SubscriptionOptions::acknowledged())
+        .await
+        .unwrap();
+    sub.wait_ready(b.endpoint_id(), wait_timeout())
+        .await
+        .unwrap();
+    let mut receipt = b
+        .publisher("jobs")
+        .unwrap()
+        .publish(
+            b.buffers().copy_from_slice(b"still authorized").unwrap(),
+            options(),
+        )
+        .await
+        .unwrap();
+    delivery(&mut sub).await.ack().await.unwrap();
+    assert_eq!(
+        receipt.wait_for_processing(wait_timeout()).await.unwrap()[0].1,
+        RecipientOutcome::Processed
+    );
+    close(&a, &b).await;
+}
+
+#[tokio::test]
+async fn revoked_member_fails_retained_delivery_and_cannot_recover_the_revoked_grant() {
+    let a = host(vec![Permission::publish("jobs").unwrap()], config()).await;
+    let code = a
+        .issue_join_code(JoinOptions::new(vec![
+            Permission::subscribe("jobs").unwrap(),
+        ]))
+        .await
+        .unwrap();
+    let b = MessagingEndpoint::join(config(), Identity::generate(), &code)
+        .await
+        .unwrap();
+    let mut sub = b
+        .subscribe("jobs", SubscriptionOptions::acknowledged())
+        .await
+        .unwrap();
+    sub.wait_ready(a.endpoint_id(), wait_timeout())
+        .await
+        .unwrap();
+    let mut receipt = a
+        .publisher("jobs")
+        .unwrap()
+        .publish(a.buffers().copy_from_slice(b"revoked").unwrap(), options())
+        .await
+        .unwrap();
+    let held = delivery(&mut sub).await;
+    a.disconnect(b.endpoint_id()).await.unwrap();
+    a.deny_certificate(b.certificate().id()).await.unwrap();
+    assert_eq!(
+        receipt.wait_for_processing(wait_timeout()).await.unwrap()[0].1,
+        RecipientOutcome::Failed(Error::Unauthorized)
+    );
+    assert_eq!(b.rejoin(&code).await, Err(Error::Unauthorized));
+    drop(held);
+    close(&a, &b).await;
+}
+
+#[tokio::test]
+async fn expired_code_and_certificate_have_separate_lifetimes() {
+    let a = host(vec![], config()).await;
+    let mut opts = JoinOptions::new(vec![]);
+    opts.lifetime = Duration::from_secs(1);
+    opts.certificate_lifetime = Duration::from_secs(3);
+    let code = a.issue_join_code(opts).await.unwrap();
+    let b = MessagingEndpoint::join(config(), Identity::generate(), &code)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(matches!(
+        MessagingEndpoint::join(config(), Identity::generate(), &code).await,
+        Err(Error::CertificateExpired)
+    ));
+    assert_eq!(a.metrics().await.unwrap().peers, 1);
+    timeout(Duration::from_secs(4), async {
+        while a.metrics().await.unwrap().peers != 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    close(&a, &b).await;
+}
+
+#[tokio::test]
+async fn renewed_grant_preserves_pending_message_and_removed_permissions_are_enforced() {
+    let a = host(vec![Permission::both("jobs").unwrap()], config()).await;
+    let code = a
+        .issue_join_code(JoinOptions::new(vec![Permission::both("jobs").unwrap()]))
+        .await
+        .unwrap();
+    let b = MessagingEndpoint::join(config(), Identity::generate(), &code)
+        .await
+        .unwrap();
+    let mut sub = a
+        .subscribe("jobs", SubscriptionOptions::acknowledged())
+        .await
+        .unwrap();
+    sub.wait_ready(b.endpoint_id(), wait_timeout())
+        .await
+        .unwrap();
+    let mut receipt = b
+        .publisher("jobs")
+        .unwrap()
+        .publish(b.buffers().copy_from_slice(b"renew").unwrap(), options())
+        .await
+        .unwrap();
+    let held = delivery(&mut sub).await;
+    let id = held.message_id.clone();
+    b.disconnect(a.endpoint_id()).await.unwrap();
+    let updated = a
+        .issue_join_code(JoinOptions::new(vec![Permission::publish("jobs").unwrap()]))
+        .await
+        .unwrap();
+    b.rejoin(&updated).await.unwrap();
+    sub.wait_ready(b.endpoint_id(), wait_timeout())
+        .await
+        .unwrap();
+    held.ack().await.unwrap();
+    assert_eq!(
+        receipt.wait_for_processing(wait_timeout()).await.unwrap()[0].1,
+        RecipientOutcome::Processed
+    );
+    assert_eq!(receipt.message_id, id);
+    assert!(matches!(
+        b.subscribe("jobs", SubscriptionOptions::default()).await,
+        Err(Error::Unauthorized)
+    ));
+    let stranger = host(vec![], config()).await;
+    let unrelated = stranger
+        .issue_join_code(JoinOptions::new(vec![]))
+        .await
+        .unwrap();
+    assert_eq!(b.rejoin(&unrelated).await, Err(Error::Unauthorized));
+    stranger.shutdown(ShutdownMode::Immediate).await.unwrap();
+    close(&a, &b).await;
+}
+
+#[tokio::test]
+async fn join_limits_are_validated_and_membership_memory_is_bounded() {
+    let mut c = config();
+    c.max_peers = 1;
+    c.max_topics = 1;
+    let a = host(vec![], c).await;
+    let mut invalid = JoinOptions::new(vec![]);
+    invalid.max_uses = 0;
+    assert!(matches!(
+        a.issue_join_code(invalid).await,
+        Err(Error::Config(_))
+    ));
+    let code = a.issue_join_code(JoinOptions::new(vec![])).await.unwrap();
+    assert!(matches!(
+        a.issue_join_code(JoinOptions::new(vec![])).await,
+        Err(Error::QueueFull)
+    ));
+    let b = MessagingEndpoint::join(config(), Identity::generate(), &code)
+        .await
+        .unwrap();
+    b.shutdown(ShutdownMode::Immediate).await.unwrap();
+    // Disconnecting cannot free the admission record and bypass the membership ceiling.
+    assert!(matches!(
+        MessagingEndpoint::join(config(), Identity::generate(), &code).await,
+        Err(Error::QueueFull)
+    ));
+    assert!(a.metrics().await.unwrap().metadata_bytes <= config().metadata_bytes);
+    a.shutdown(ShutdownMode::Immediate).await.unwrap();
+}
+
+#[tokio::test]
+async fn relay_only_join_code_connects_two_then_three_peers() {
+    use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+    let mut relay_config = ServerConfig::default();
+    relay_config.relay = Some(RelayConfig::new(
+        "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
+    ));
+    let relay = Server::spawn(relay_config).await.unwrap();
+    let url = format!("http://{}", relay.http_addr().unwrap())
+        .parse()
+        .unwrap();
+    let mut c = config();
+    c.relay_only = true;
+    c.bind_addr = None;
+    c.relay_mode = RelayMode::custom([url]);
+    let a = host(vec![Permission::subscribe("jobs").unwrap()], c.clone()).await;
+    a.online(wait_timeout()).await.unwrap();
+    let code = a
+        .issue_join_code(JoinOptions::new(vec![Permission::publish("jobs").unwrap()]))
+        .await
+        .unwrap();
+    let mut sub = a
+        .subscribe("jobs", SubscriptionOptions::acknowledged())
+        .await
+        .unwrap();
+    let b = MessagingEndpoint::join(c.clone(), Identity::generate(), &code)
+        .await
+        .unwrap();
+    let third = MessagingEndpoint::join(c, Identity::generate(), &code)
+        .await
+        .unwrap();
+    for peer in [&b, &third] {
+        sub.wait_ready(peer.endpoint_id(), wait_timeout())
+            .await
+            .unwrap();
+        let mut receipt = peer
+            .publisher("jobs")
+            .unwrap()
+            .publish(
+                peer.buffers()
+                    .copy_from_slice(b"joined over relay")
+                    .unwrap(),
+                options(),
+            )
+            .await
+            .unwrap();
+        delivery(&mut sub).await.ack().await.unwrap();
+        assert_eq!(
+            receipt.wait_for_processing(wait_timeout()).await.unwrap()[0].1,
+            RecipientOutcome::Processed
+        );
+    }
+    close(&a, &b).await;
+    third.shutdown(ShutdownMode::Immediate).await.unwrap();
+    relay.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn idle_publishers_do_not_reserve_another_publishers_receive_capacity() {
+    let mut c = config();
+    c.payload_bytes = 512;
+    c.subscription_messages = 1;
+    let receiver = host(vec![Permission::subscribe("jobs").unwrap()], c).await;
+    let idle = member(
+        &receiver,
+        vec![Permission::publish("jobs").unwrap()],
+        config(),
+    )
+    .await;
+    let active = member(
+        &receiver,
+        vec![Permission::publish("jobs").unwrap()],
+        config(),
+    )
+    .await;
+    let mut sub = receiver
+        .subscribe("jobs", SubscriptionOptions::default())
+        .await
+        .unwrap();
+    sub.wait_ready(idle.endpoint_id(), wait_timeout())
+        .await
+        .unwrap();
+    sub.wait_ready(active.endpoint_id(), wait_timeout())
+        .await
+        .unwrap();
+    assert_eq!(receiver.metrics().await.unwrap().outstanding_credits, 0);
+    let mut r = active
+        .publisher("jobs")
+        .unwrap()
+        .publish(
+            active.buffers().copy_from_slice(b"active").unwrap(),
+            options(),
+        )
+        .await
+        .unwrap();
+    delivery(&mut sub).await.ack().await.unwrap();
+    r.wait_for_processing(wait_timeout()).await.unwrap();
+    close(&idle, &receiver).await;
+    active.shutdown(ShutdownMode::Immediate).await.unwrap();
 }

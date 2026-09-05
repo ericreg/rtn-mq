@@ -1,22 +1,22 @@
 # Iroh Brokerless Messaging
 ## Architecture and Version 1 Protocol
 
-**Status:** Memory-only Rust baseline implemented; optional durability and storage extensions remain unimplemented  
+**Status:** Breaking join-code-only, memory-only Rust baseline implemented; optional durability and storage extensions remain unimplemented  
 **Date:** September 4, 2026  
 **Implementation language:** Rust  
 **Deployment model:** An embedded messaging endpoint in each application
 
 ## 1. Design summary
 
-Build a small, brokerless publish/subscribe library on Iroh. Applications connect using cryptographic endpoint identities and invitation material rather than managing peer IP addresses, routing rules, or DNS names. Each endpoint owns its connections, authorization policy, subscriptions, bounded queues, and pending deliveries.
+Build a small, brokerless publish/subscribe library on Iroh. Applications connect exclusively through reusable join codes carrying a pinned host identity, realm, authority public key, bounded address hints, expiry, and bearer secret. Each endpoint owns its connections, authorization policy, subscriptions, bounded queues, and pending deliveries.
 
-An **orchestrator** issues signed delegations that authorize independently generated endpoint keys. It is an authority and enrollment service, not a message broker. Publishers send directly to authorized subscribers; no application-level intermediary forwards messages.
+A **host** owns its realm authority and enrolls independently generated peer keys through join codes. The host and each joined peer communicate directly according to their certificates. There is no member-to-member connection, discovery, directory, or forwarding in this baseline. Enrollment and messaging share the host endpoint but use separate ALPNs; its root signing key differs from its transport key.
 
 The public abstraction is deliberately small:
 
 ```text
-join an authorized realm
-connect invited peers
+start a host and issue a reusable join code
+join its realm and connect to that host
 publish to an exact topic
 subscribe to an exact topic
 receive a message and acknowledge its processing
@@ -26,11 +26,11 @@ The performance objective is **minimal copying with bounded memory**, not an unc
 
 | Area | Version 1 decision |
 |---|---|
-| Network topology | Direct application-to-application pub/sub; no forwarding or global mesh |
+| Network topology | Direct host-to-joined-peer pub/sub; no forwarding or global mesh |
 | Roles | Orchestrator, publisher, subscriber; an application may combine roles |
 | Identity | Independent endpoint key pairs; orchestrator-signed delegations |
 | Message authenticity | Signed message envelopes, verified against the authorized endpoint identity |
-| Bootstrap | Explicit invites or provisioned peer identities and connection hints |
+| Bootstrap | Reusable join codes only; no externally provisioned startup or address-based connect API |
 | Discovery | No application-level global peer or topic discovery |
 | Topics | Exact, case-sensitive names scoped to a realm |
 | Delivery | Best-effort or acknowledged, bounded retry; duplicates are possible |
@@ -60,11 +60,13 @@ A topic is not a durable log. A disconnected subscriber does not automatically r
 
 ## 3. Roles and component ownership
 
-### Orchestrator
+### Host and realm authority
 
-The orchestrator holds a **root signing key**, enrolls endpoints, and issues certificates granting topic permissions. Its signing key is separate from any Iroh transport identity it uses for enrollment. It may also distribute peer contact material and revocation updates.
+`MessagingEndpoint::host` creates a new authority and realm, signs a 24-hour certificate for its independent transport identity, and starts the endpoint owner. `issue_join_code` associates permissions, expiry, certificate lifetime, and a distinct-registration limit with a random secret. Only hosts can issue codes.
 
-Existing authorized peers can continue exchanging messages while the orchestrator is unavailable, until their authorization expires or a configured freshness policy requires an update. Enrollment and renewal may require the orchestrator to be reachable.
+`MessagingEndpoint::join` generates no remote keys: the caller supplies its own `Identity`. The code establishes the initial trusted host/root/realm. The joining endpoint redeems the secret against the authenticated host, verifies its certificate, and establishes a messaging session. `rejoin(&code)` repeats this flow against the same host while preserving local delivery state. Every establishment/re-establishment originates from a valid join code.
+
+There is no separate public authority/enrollment service or certificate-based endpoint constructor. The internal authority signs only the host identity and code-issued member certificates. Host availability is required to enroll or rejoin. Since every supported link is to the host, losing it interrupts these links; no member-to-member path is created automatically.
 
 ### Publisher and subscriber endpoints
 
@@ -82,19 +84,14 @@ Publisher and subscriber are capabilities of the same endpoint implementation, n
 | Storage interface | Memory implementation now; optional journal implementation later |
 
 ```text
-                          Orchestrator
-                    root signing authority
-                         /           \
-                 delegation       delegation
-                     /                 \
-              Application A       Application B
-              + Endpoint A        + Endpoint B
-              + local queues      + local queues
-                     \                 /
-                      authenticated Iroh
-                       message connection
+       Host A: root authority + messaging endpoint + bounded local queues
+                    /                              \
+             join code + Iroh                 join code + Iroh
+                  /                                  \
+          Joined peer B                         Joined peer C
+          own key and certificate               own key and certificate
 
-               No application message broker
+          No B-to-C discovery, connection, or message forwarding
 ```
 
 Iroh provides authenticated, encrypted QUIC connectivity and may use relays when a direct path is unavailable. Those relays forward encrypted transport traffic; they are not this library's topic router, durable queue, or offline mailbox. Brokerless does not necessarily mean infrastructure-free. [S1]
@@ -124,13 +121,17 @@ A delegation contains:
 
 Certificate limits can only restrict the receiver's local limits, not raise them. Version 1 permits **one delegation level**, root to endpoint; clients cannot issue further delegations.
 
-### 4.2 Enrollment and invitations
+### 4.2 Reusable join codes
 
-An enrollment invitation carries a pinned authority identity, realm information, enrollment contact information, expiry, and a high-entropy, single-use enrollment secret. The endpoint connects to the authenticated enrollment service, proves possession of its endpoint key, and redeems the invitation for a certificate with the invitation's predetermined permissions.
+The only public bootstrap is a `JoinCode`. Its trusted delivery establishes the initial root/host identity and grants permission to enroll. It carries 32 random secret bytes and is explicitly encoded as a pasteable `rtn-mq://join/…` string. Debug output omits the secret. No endpoint private key is included.
 
-A human-friendly code is an encoding or lookup mechanism, not permission to use a guessable secret without rate limits. Deliver the authority fingerprint and invitation through a trusted channel. Never accept an arbitrary root supplied by a connecting peer.
+The host owner stores the secret hash, fixed permissions/limits, expiry, maximum uses, and a cache indexed by the authenticated joining endpoint ID. Different identities receive distinct certificates. The same identity recovers its still-valid cached certificate without using another registration; an expired grant may be renewed while the code is valid. Concurrent redemptions are serialized with issuance and membership registration before returning success. Revoked certificates are not recovered through their cached grant.
 
-For pre-provisioned deployments, the same flow can happen offline: an administrator signs a supplied endpoint public key and distributes the certificate and peer contact material. The runtime need not require an always-on enrollment service.
+Defaults are one-hour code lifetime, one-hour certificate lifetime, and 256 distinct registrations per code. Lifetimes are 1 second–24 hours; maximum uses are 1–256. Issued certificates cannot outlive the host's 24-hour certificate. The code's embedded expiry is checked by clients, and the authoritative stored expiry and secret hash are checked by the host. Editing a code does not extend its host-side policy.
+
+Active codes are bounded by `Config::max_topics`; unexpired issued-certificate records by `max_peers`; all retained state is metered against metadata limits. Membership records remain after disconnect and code expiry so connection admission and accounting cannot be bypassed. Expiring/revoking a code disables future enrollment through it; `deny_certificate` independently revokes an issued member certificate.
+
+Host keys, grants, counters, membership records, and replay state are in memory. Restart creates a new realm and invalidates old codes. Durable host identity and enrollment recovery require a future storage design. Persisting only an endpoint `Identity` does not preserve host membership.
 
 ### 4.3 Connection authorization
 
@@ -138,7 +139,8 @@ After the Iroh handshake completes, both endpoints exchange their certificates. 
 
 1. Verifies the certificate signature against an already trusted root and checks the realm, validity interval, revocation state, and local policy.
 2. Requires `subject_endpoint_id` to equal the identity authenticated by the Iroh connection.
-3. Authorizes each subscription or publication against the relevant exact-topic permission.
+3. On the host, requires the certificate ID and authenticated subject to match an issued membership record. On a joined peer, requires the remote endpoint ID to be its code-pinned host. A valid root signature alone does not admit an unregistered peer.
+4. Authorizes each subscription or publication against the relevant exact-topic permission.
 
 Iroh authenticates peer identities, but application authorization remains the application's responsibility. Its `Connection::remote_id()` exposes the authenticated endpoint identity. A copied certificate without possession of that endpoint's private key must not be enough to connect as that endpoint. [S1][S2]
 
@@ -177,26 +179,13 @@ Receivers may apply signed revocation snapshots or administratively provisioned 
 
 Use wall-clock time with a documented skew allowance for certificate and message expiry, and monotonic time for local retry timers. Large clock anomalies should fail closed for new protected operations. Key replacement requires a new certificate and contact update. Root rotation requires an explicit trust update or controlled overlap, never an untrusted peer's assertion.
 
-## 5. Peer bootstrap without global discovery
+## 5. Connection bootstrap and discovery
 
-**A topic name identifies an interest, not a network location.** Two isolated applications cannot find one another merely by calling `subscribe("jobs")` and `publish("jobs")`.
+Join codes include the host endpoint ID and current bounded IP/relay hints. Default Iroh address lookup may resolve this already-known identity; it does not discover realm members or topic participants. Hosts should wait for `online(Duration)` before issuing relay-dependent codes. Direct-only LAN deployments omit that wait and bind a reachable local address.
 
-Keep this distinction:
+No contact-export or arbitrary-address connect API is public. The joining endpoint dials the host after code redemption. Both sides exchange authenticated subscription interests over that connection; topic readiness is separate from transport establishment.
 
-| Mechanism | V1 treatment |
-|---|---|
-| Learning which peers are relevant | Explicit invitation or deployment configuration |
-| Resolving a known endpoint identity to a network path | Iroh connection hints or configured Iroh address lookup |
-| Learning a connected peer's topic interests | Authenticated `SUBSCRIBE` messages |
-| Searching the entire network for topic members | Not implemented |
-
-An invitation can include known peer `EndpointId` values and sufficient `EndpointAddr` contact hints. Alternatively, configured Iroh address lookup can resolve known identities. Without address lookup, the application must retain and refresh sufficient contact information itself. Hints can become stale. [S3][S4]
-
-Applications therefore do not manage IP addresses or DNS names in their messaging API, even though Iroh may use addressing infrastructure internally. A requirement to avoid DNS entirely would need an explicit transport configuration; hiding DNS from application callers is a different requirement.
-
-After connection authorization, each endpoint sends its local subscription interests to the other. The receiving endpoint accepts an interest only when the subscriber is authorized to subscribe and the local endpoint is authorized to publish that topic. It can accept before a local publisher handle exists, allowing that publisher to start later.
-
-On reconnect, replay local subscription interests and reauthorize them. No gossip, global directory, membership consensus, or automatic forwarding is required. When the orchestrator introduces peers, it distributes contact metadata only; application messages still flow directly between their endpoints.
+B and C joining A creates A–B and A–C sessions only. Neither receives the other's address, certificate, or subscription inventory. There is no peer directory, introduction mechanism, global membership search, or forwarding. Rejoin replays still-authorized local subscriptions and reuses their IDs within the running endpoint.
 
 ## 6. Topic and subscription semantics
 
@@ -419,8 +408,8 @@ Paths in the ESP source column are relative to the reviewed checkout. The adapte
 | Private state | `read_private_config`, `write_private_config`, `write_private_config_temp`, metadata validation helpers | Private files, exclusive temporary-file creation, file sync, atomic replacement, Unix symlink/hard-link and permission checks. | `identity`: messaging-owned state format and caller-selected location. Bound file reads, check existing parent-directory permissions, and define equivalent protection or explicit limitations on other platforms. |
 | Connection lifecycle | `daemon`, `sync_joined_config_once`, `handle_incoming_connection` | Inject a stable secret key into the endpoint; connect to known identities; use relay-capable connectivity; bound handshake/setup time; close resources on completion. | `transport`: native `iroh-mq/1`, explicit contact hints or configured address lookup, bounded admission, cancellation, and owned task cleanup. |
 | Authenticated identity binding | `sync_control_config`, `validate_peer_report`, `verified_membership_for_peer`, `MembershipCertificate::matches_peer` | Derive the peer identity from `Connection::remote_id()` and require the signed subject to match it. A remembered peer is not automatically authorized. | `session`: mutual HELLO/READY validation against a locally trusted root, the configured realm, and current policy before protected traffic. |
-| Invitation redemption | `Config::issue_invite`, `invite_grant_for_proof`, `consume_invite_proof`, `consume_invite_and_issue_membership`, `commit_config_change` | Store a secret hash at the issuer; bind the resulting grant to the authenticated joining endpoint; serialize consumption with issuance and persistence. | `enrollment`: predetermined exact-topic permissions, expiration, bounded outstanding invites, pinned root and enrollment endpoint identities, and single-use redemption. |
-| Pending enrollment | `join_hello_from_config`, `hello_from_config`, `ensure_completed_join`, `save_completed_join` | Send the bearer secret only to the intended enrollment peer; complete validation before recording successful enrollment; remove pending proof afterward. | `enrollment`: an explicit enrollment exchange. Normal messaging sessions carry certificates, never enrollment secrets. |
+| Invitation redemption | `Config::issue_invite`, `invite_grant_for_proof`, `consume_invite_proof`, `consume_invite_and_issue_membership`, `commit_config_change` | Store a secret hash at the issuer; bind the resulting grant to the authenticated joining endpoint; serialize consumption with issuance and persistence. | `join`: fixed exact-topic permissions, expiration, bounded reusable codes, distinct-identity limits, and pinned root/host identities. |
+| Pending enrollment | `join_hello_from_config`, `hello_from_config`, `ensure_completed_join`, `save_completed_join` | Send the bearer secret only to the intended enrollment peer; complete validation before recording successful enrollment; remove pending proof afterward. | `join`: an explicit code-redemption exchange on the host endpoint. Normal messaging sessions carry certificates, never enrollment secrets. |
 | Signing and verification | `MembershipCertificate::issue_for_network`, `verify_signature`, `signature_payload`; corresponding policy and revocation methods | Use Iroh's signing/verification APIs, bind all relevant claims, separate signature contexts, and fail on tampering. | `auth` and `message`: strict COSE_Sign1 Ed25519 profiles, exact authenticated bytes, messaging-specific claims and contexts. |
 | Authorization intersection | `normalize_allowed_ports`, `ensure_port_allowed`, `ensure_membership_allows_port` | A signed grant can restrict local policy but cannot increase it. | `auth`: exact-topic publish/subscribe permissions and certificate ceilings intersected with local limits. |
 | Revocation | `remember_revocations_in_config`, `is_node_revoked`, `terminate_revoked_connections`, `run_config_actor` | Verify updates before accepting them; cancel affected active connections; serialize state changes. | `auth` and endpoint owner: certificate IDs, root-issued updates or administrative deny lists, version/freshness policy, expiry checks, and visible failure of affected operations. |
@@ -443,9 +432,9 @@ Per-message signatures are new work. Sign the complete immutable envelope descri
 
 ESP's reviewed invite contains network, creator, inviter, invite ID, and secret; it has no expiration field. Messaging adds expiry and connection material while distinguishing the pinned authority signing key from the enrollment service's authenticated transport identity. A peer-supplied issuer key must never become a trusted root merely because it verifies a signature.
 
-Retain hashed bearer-secret storage and serialized redemption. Generate secrets from a cryptographically secure random source, bound decoding before allocation, and rate-limit redemption. Persist the consumed state and issued authorization together before returning enrollment success when using persistent enrollment state. ESP's clone/validate/save/commit sequence is the reference for avoiding partial state publication, but its ignored parent-directory sync errors must not become a claim of crash-durable single-use enforcement.
+Retain hashed bearer-secret storage and serialized redemption. Generate secrets from a cryptographically secure random source, bound decoding before allocation, and rate-limit redemption. A future persistent store must commit code usage, issued authorization, and membership admission together before enrollment success. ESP's clone/validate/save/commit sequence is the reference for avoiding partial state publication, but its ignored parent-directory sync errors must not become a claim of crash-durable enrollment enforcement.
 
-Define lost-response recovery explicitly: a completed grant may be returned again only to the same authenticated endpoint, within its validity and policy bounds. Recovery must not let the same invitation authorize a second endpoint. Offline provisioning can establish the first secure messaging path, as allowed by architecture section 4.2; online enrollment remains a separate flow.
+ESP consumes a code after one enrollment. This implementation deliberately extends that logic to reusable codes: each distinct endpoint consumes one of the configured uses, and same-endpoint recovery returns its own cached certificate. Shared usage limits and membership state are serialized by the host owner. There is no offline provisioning connection path.
 
 The Unix private-file checks are useful source material. Platform behavior needs its own review: ESP's non-Unix permission helpers are no-ops, and existing directory permissions are not checked by its `validate_state_dir` function. Preserve the intended private-state invariant while adapting those helpers.
 
@@ -537,7 +526,11 @@ SUBACK result `0` accepts, `1` denies permission, and `2` rejects capacity. ACK 
 
 CREDIT uses `slots = 0, bytes > 0` to request capacity for an actual pending frame; it is not a grant. The receiver fairly rotates outstanding requests and grants `slots = 1` with a byte ceiling covering the negotiated maximum payload, 16 KiB metadata, and the 12-byte frame prefix. Only one unconsumed grant is allowed per binding. `slots = 0, bytes = 0` returns/cancels unused capacity. This prevents idle publishers from reserving all receiver memory. A sender consumes a grant only for a frame within its byte ceiling, and cannot apply a grant from another session or subscription.
 
-Network enrollment uses the separate `iroh-mq/enrollment/1` ALPN. The invitation is base64url (without padding) of `[1, encoded_peer_contact, expires_at, invite_id, secret]`; the secret is 32 random bytes. A contact encodes `[1, realm, authority_public_key, endpoint_public_key, addresses]`, with at most 16 `ip:` or `relay:` text hints. Enrollment HELLO contains `[1, invite_id, secret]`, and successful READY contains `[1, certificate_bytes]`; failure is type 11 with `[1, 1]`. The caller verifies the invite against its configured root and realm, and Iroh authenticates the enrollment service identity. The single-owner authority binds redemption to `remote_id()`. State is in memory, bounded by configured invite/metadata limits; a restart invalidates outstanding invitations.
+Join enrollment uses `iroh-mq/join/1` on the same Iroh endpoint as messaging (`iroh-mq/1`). The code is `rtn-mq://join/` followed by unpadded base64url of canonical CBOR `[1, realm, authority_public_key, host_endpoint_public_key, addresses, code_id, expires_at, secret]`. IDs/keys retain the sizes above; the secret is 32 bytes. There are at most 16 address strings, each at most 1,024 bytes, with `ip:` or `relay:` prefixes. The encoded code is at most 32 KiB. Unsupported prefixes/versions, indefinite arrays, wrong sizes, trailing data, and noncanonical encodings are rejected.
+
+Join HELLO contains `[1, code_id, secret]` (at most 128 bytes of metadata). Successful READY contains `[1, certificate_bytes]`; failure is type 11 with `[1, reason]`, where `1` means unauthorized and `2` means capacity exhausted. Request, response, and code schemas are CBOR. The certificate subject is bound to `Connection::remote_id()`; credentials are never accepted as authorization for another transport key. Secrets appear only on the authenticated join connection, never on a DATA session.
+
+Enrollment uses the same bounded accept quotas, rate limits, timeout, and scratch-memory reservations as messaging. `join()` completes registration locally after certificate verification and the mutual HELLO/READY handshake; subscription readiness requires `wait_ready` or publisher-side admission handling. Unregistered certificates are rejected by the host owner even if otherwise root-signed.
 
 Independent Python CBOR and Ed25519 fixtures for delegation, envelope, HELLO, and DATA live in `tests/fixtures`, with their generator in `tools/generate_fixtures.py`. Rust verification and encoding are checked against those fixtures.
 
@@ -585,50 +578,30 @@ V1 returns `MessageTooLarge` above the configured inline limit. A future blob-re
 
 That extension must define blob availability, retention, access control, garbage collection, and when the message may be ACKed. A content hash verifies content identity; it is not an authorization token or a guarantee that somebody still stores the bytes.
 
-## 14. Illustrative Rust API
+## 14. Public API
 
-The following illustrates the implemented API. [examples/direct.rs](examples/direct.rs) contains a complete runnable version with provisioning, two endpoints, and processing receipts. Dependencies are pinned in `Cargo.toml` and `Cargo.lock`.
+The only constructors are `MessagingEndpoint::host(config, identity, permissions)` and `MessagingEndpoint::join(config, identity, &code)`. `Config::new()` configures networking and budgets; root/realm trust is established internally by hosting or by accepting a trusted code. The root signing key is never the endpoint transport key.
 
 ```rust
+use rtn_mq::*;
 use std::time::Duration;
 
-// Each process owns an independently generated endpoint key and a delegation.
-let endpoint = MessagingEndpoint::start(config, identity, delegation).await?;
-
-// One-time bootstrap: applications need not supply IPs or DNS names here.
-endpoint.connect(peer_invite).await?;
-
-let mut subscription = endpoint
-    .subscribe("jobs/image-processing", SubscriptionOptions::acknowledged())
-    .await?;
-
-let publisher = endpoint.publisher("jobs/image-processing")?;
-let payload = endpoint.buffers().copy_from_slice(b"example job")?;
-
-// Local routing and bounded admission, not remote processing success.
-let mut receipt = publisher.publish(payload, PublishOptions::default()).await?;
-
-// The receiver borrows from a tracked immutable payload lease.
-while let Some(delivery) = subscription.recv().await? {
-    match handle_job(delivery.payload()).await {
-        Ok(()) => delivery.ack().await?,
-        Err(error) => delivery.nack(classify(error)).await?,
-    }
+async fn create_host() -> Result<(MessagingEndpoint, JoinCode)> {
+    let host = MessagingEndpoint::host(Config::new(), Identity::generate(),
+        vec![Permission::both("jobs")?]).await?;
+    host.online(Duration::from_secs(30)).await?;
+    let code = host.issue_join_code(JoinOptions::new(vec![Permission::both("jobs")?])).await?;
+    Ok((host, code))
 }
-
-// On the publishing side, observe per-recipient processing outcomes.
-let outcomes = receipt.wait_for_processing(Duration::from_secs(5)).await?;
-
-endpoint.shutdown(ShutdownMode::Drain { timeout: Duration::from_secs(10) }).await?;
 ```
 
-Public waits accept a `Duration` timeout and track elapsed time internally. Each receipt wait has one shared timeout across all recipient outcomes, and subscription updates do not reset the readiness timeout. Timing out returns `Error::Timeout` without cancelling an admitted message. Shutdown draining takes a duration and converts it to one internal deadline when the shutdown call starts.
+Share `code.encode()` privately. A joining process decodes it with `JoinCode::decode`, supplies its own identity to `join`, and uses the existing `subscribe`, `publisher`, receipt, and ACK/NACK APIs. `rejoin(&code)` preserves the running endpoint's identity, publisher epoch, pending IDs, and authorized subscription IDs. A code must be valid and target the same host/realm; raw address-based reconnect is not available.
 
-The publisher and receiver fragments normally run in different applications or concurrent tasks. `copy_from_slice` explicitly copies; an ownership-taking publish path or in-place builder avoids that copy for callers that already own a compatible immutable buffer.
+`revoke_join_code(code.id())` stops enrollment through a code. `certificate()` exposes the local certificate for audit/revocation; `deny_certificate(id)` revokes a member independently of its code. There are no external-certificate startup, standalone enrollment, contact invite, or direct-address connect APIs and no compatibility wrappers.
 
-A nonblocking submission variant may return a ticket immediately after bounded ingress insertion. Its documented result must distinguish **ingress accepted** from the later routing/admission receipt. Cancellation of a wait does not retract a publication already admitted; cancellation of pending delivery is a separate best-effort operation with visible partial outcomes.
+Public waits accept `Duration`, including `wait_ready`, `wait_for_processing`, and `online`. One timeout covers all receipt recipients or readiness updates. Timeout does not cancel admitted delivery. Shutdown uses `ShutdownMode::Immediate` or `ShutdownMode::Drain { timeout: Duration::from_secs(10) }`; the deadline is computed internally.
 
-Useful error categories include `Unauthorized`, `CertificateExpired`, `NoSubscribers`, `AlreadySubscribed`, `QueueFull`, `MessageTooLarge`, `PeerUnavailable`, `DeliveryExpired`, `ProtocolMismatch`, and `ShuttingDown`. An uncertain remote processing outcome must not be mislabeled as proof that processing did not happen.
+See [USER_GUIDE.md](USER_GUIDE.md), [examples/direct.rs](examples/direct.rs), and [examples/two_computers.rs](examples/two_computers.rs) for runnable workflows.
 
 ## 15. Failures, shutdown, and observability
 
@@ -638,7 +611,7 @@ Useful error categories include `Unauthorized`, `CertificateExpired`, `NoSubscri
 | Peer disconnects | Mark its subscription bindings inactive for new publications; retain eligible existing deliveries until their deadline |
 | Processing ACK is lost | Retry with the same identity; regenerate ACK when deduplication state proves completion |
 | Certificate expires or is revoked | Stop new protected operations and reject unauthorized retries; notify callers |
-| Orchestrator unavailable | Existing valid sessions continue within their validity/freshness bounds; enrollment or renewal may fail |
+| Host unavailable | Host-to-peer sessions stop; enrollment/rejoin cannot complete; retained deliveries remain bounded by their deadlines |
 | Publisher crashes | Memory-only pending deliveries are lost; no durability claim |
 | Subscriber crashes | Memory-only queued messages and deduplication state are lost; retained sender deliveries may be retried |
 | Oversized or malformed frame | Reject before unbounded allocation; rate-limit repeated abuse |
@@ -677,15 +650,15 @@ A very large fan-out topic may eventually need a forwarding overlay or brokers. 
 
 ### Milestone 1: Secure direct messaging
 
-Implement endpoint lifecycle, enrollment or offline provisioning, mutual certificate validation, native Iroh protocol registration, exact topics, subscription readiness, and signed DATA frames. Verify direct and relayed paths with two and then three peers. One authority should be able to authorize independent clients without joining their data path.
+Implement host/join lifecycle, reusable-code enrollment, registered-member admission, mutual certificate validation, native Iroh protocol registration, exact topics, subscription readiness, and signed DATA frames. Verify direct and relayed paths with two and then three peers. One host should authorize multiple independently keyed peers without forwarding messages between them.
 
 #### Implementation order and ESP adaptation
 
 1. Define strict topics, identity types, delegation claims, and the COSE signature profiles with golden fixtures. Adapt private-state helpers into an optional messaging-owned store.
-2. Implement offline root issuance and verification, including wrong-root/realm/subject, expiry, permission, and revocation rejection. This allows secure endpoint development without an online orchestrator.
+2. Implement internal root issuance and verification plus join-code-only host admission, including wrong-root/realm/subject, expiry, permission, registration, and revocation rejection.
 3. Adapt endpoint creation, authenticated peer binding, timeouts, and bounded connection admission. Implement mutual HELLO/READY and deterministic session ownership.
 4. Implement exact-topic SUBSCRIBE/SUBACK readiness and signed DATA using the framing and baseline resource bounds in the architecture. Keep the public delivery guarantees limited to the behavior actually implemented.
-5. Verify two- and three-peer communication over direct and relayed paths, with the signing authority absent from the data path. Add online invitation redemption using the same issuance/verification primitives when implementing enrollment.
+5. Verify reusable-code enrollment and two/three-peer host communication over direct and relay-only paths, including concurrency, bounded uses, code revocation, and same-key response recovery.
 
 ACK/NACK receipts, credits, retry/reconnect semantics, and deduplication continue under Milestone 2. Metered buffer optimization, borrowed access to CBOR payload bytes, and SPSC specialization remain Milestone 3. ESP reuse does not supply these messaging guarantees.
 
@@ -703,7 +676,7 @@ Only after the memory baseline is correct, add the journal interface and recover
 
 ### Current implementation and validation boundary
 
-Milestones 1 and 2 have a runnable memory-only implementation: offline provisioning and online enrollment, mutual authorization, signed messages, exact topics, subscription readiness, receipts, credits, ACK/NACK, expiry, revocation, renewal, explicit reconnect, cancellation, and drain deadlines. Renewal keeps the endpoint key, publisher epoch, pending message IDs, and still-authorized subscription IDs; peers reconnect to exchange the new certificate. Applications choose reconnect timing and refresh contact hints.
+Milestones 1 and 2 have a runnable memory-only implementation: join-code-only host startup and reusable enrollment, mutual authorization, signed messages, exact topics, subscription readiness, receipts, credits, ACK/NACK, expiry, revocation, renewal, explicit reconnect, cancellation, and drain deadlines. Renewal keeps the endpoint key, publisher epoch, pending message IDs, and still-authorized subscription IDs; peers reconnect to exchange the new certificate. Applications choose reconnect timing and refresh contact hints.
 
 The baseline also implements metered shared payload leases and `rtrb` SPSC rings for topic writer/subscription lanes. CBOR protocol parsing uses bounded schemas; application CBOR decoders can read directly from leased byte slices. Actual MPSC ingress/event paths remain bounded Tokio channels. Ring push/pop operations use rtrb's implementation; async notifications are separately synchronized, so the complete enqueue/wakeup path is not claimed to be lock-free. Tests exercise cross-thread ring wraparound, cancelled waits, closure, retained leases, and shutdown. A reusable allocation pool, formal model checking, cross-platform memory-safety runs, and broader optimization studies remain follow-up work.
 
@@ -711,7 +684,7 @@ The implementation caps inline payloads at 1 MiB and metadata at 16 KiB. Queues 
 
 Private-key persistence is implemented for Unix with explicit private-directory/file checks and atomic replacement. Other platforms use application-provided key stores. Enrollment, queues, replay state, and revocation version state remain in memory. Restart-resistant revocation rollback protection requires application-managed trust-state persistence.
 
-The suite includes direct and relay-only two/three-peer tests, a real stolen-certificate handshake, unaddressed ACK rejection, single-use enrollment races and response recovery, renewal, active/disconnected revocation, expiry, partial fan-out, abandoned processing, lost ACK recovery, and budget retention across reconnects. The local relay test disables direct IP transports, so a direct connection cannot accidentally satisfy it. No durability or io_uring storage claim is made.
+The suite includes direct and relay-only two/three-peer tests, a real stolen-certificate handshake, unaddressed ACK rejection, reusable-code enrollment races, usage limits, code revocation, and same-key response recovery, renewal, active/disconnected revocation, expiry, partial fan-out, abandoned processing, lost ACK recovery, and budget retention across reconnects. The local relay test disables direct IP transports, so a direct connection cannot accidentally satisfy it. No durability or io_uring storage claim is made.
 
 `examples/benchmark.rs` emits configurable direct-loopback measurements for payload size, fan-out, publish-to-processing-ACK latency, throughput, and sender budget high-water marks. These smoke measurements do not replace the complete performance/network fault-injection matrix below.
 
@@ -737,7 +710,7 @@ The reviewed ESP tests in `tests/config.rs` and `tests/internal.rs` provide usef
 |---|---|
 | Membership tampering and invalid issuer rejection | Alter signed claims, substitute the root, use the wrong realm or peer key, and attempt endpoint-issued delegation. |
 | Invite grants signed into membership; delegated port widening rejected | Sign exact-topic permissions and limits; reject unauthorized topics, actions, and attempts to widen local limits. |
-| Invite consumed once; concurrent actor redemption; same-node recovery | Race two independently keyed redeemers, permit only one grant, and recover a lost enrollment response only for that subject. |
+| Invite consumed once; concurrent actor redemption; same-node recovery | Race independently keyed redeemers against a shared configured use limit; issue distinct certificates and recover a lost response only for its original subject. |
 | Pending proof sent only during join; incomplete join not saved | Never send a secret on a data session or to another peer; expose enrollment success only after validation and commit. |
 | Known peers without valid membership rejected | Reject a configured contact or copied certificate unless the connection identity and current authorization both validate. |
 | Revocation cancels active connections | Stop protected operations in established sessions after revocation, expiry, or freshness failure. |
@@ -750,7 +723,7 @@ On the reviewed checkout, `cargo test --locked --test config --test internal` pa
 
 ## 18. Final v1 boundary
 
-The first release is an embedded, authenticated, direct pub/sub system with exact topics, invite-based bootstrap, signed delegations and message envelopes, bounded memory, processing acknowledgements, and explicit retry/failure semantics.
+The first release is an embedded, authenticated, direct pub/sub system with exact topics, join-code-only bootstrap, signed delegations and message envelopes, bounded memory, processing acknowledgements, and explicit retry/failure semantics.
 
 Its implementation should optimize ownership and eliminate unnecessary local payload copies while preserving Iroh's supported transport path. Optional durability, io_uring storage, large blobs, shared-memory IPC, request/reply, wildcard subscriptions, and consumer groups can be added independently after their semantics are specified.
 

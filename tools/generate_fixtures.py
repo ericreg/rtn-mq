@@ -25,6 +25,7 @@ message = signed([1, bytes([3])*16, public(subject), bytes([5])*16, "jobs", 1, 1
 hello = enc([1, cert, bytes([6])*16, 1024, 8, 300])
 metadata = enc([1, bytes([7])*16, bytes([8])*16, message])
 data = (len(metadata)+3).to_bytes(4,"big") + bytes([7,0,0,0]) + len(metadata).to_bytes(4,"big") + metadata + b"abc"
-for name, value in {"certificate": cert, "message": message, "hello": hello, "data": data}.items():
+join = enc([1, bytes([3])*16, public(root), public(subject), ["ip:127.0.0.1:42000"], bytes([4])*16, 200, bytes([9])*32])
+for name, value in {"join": join, "certificate": cert, "message": message, "hello": hello, "data": data}.items():
     (OUT / f"{name}.hex").write_text(value.hex() + "\n")
-print("Wrote four independently encoded and signed protocol fixtures.")
+print("Wrote five independently encoded protocol fixtures (including signed certificate/message fixtures).")

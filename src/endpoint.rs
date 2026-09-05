@@ -1,4 +1,4 @@
-mod owner;
+pub(crate) mod owner;
 pub(crate) mod transport;
 use crate::{
     auth,
@@ -26,7 +26,6 @@ use tokio_util::sync::CancellationToken;
 /// Limits are ceilings, not eagerly allocated capacity. Transport overhead is additional.
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub trust: Trust,
     pub relay_mode: RelayMode,
     /// Disable direct IP transport, e.g. to require and verify relay operation.
     pub relay_only: bool,
@@ -46,9 +45,8 @@ pub struct Config {
     pub handshake_timeout: Duration,
 }
 impl Config {
-    pub fn new(trust: Trust) -> Self {
+    pub fn new() -> Self {
         Self {
-            trust,
             relay_mode: RelayMode::Default,
             relay_only: false,
             bind_addr: None,
@@ -89,86 +87,30 @@ impl Config {
             || self.delivery_window > Duration::from_secs(300)
             || self.retry_interval.is_zero()
             || self.handshake_timeout.is_zero()
-            || self.trust.clock_skew_secs > 300
         {
             return Err(Error::Config("invalid endpoint limits"));
         }
         Ok(())
     }
 }
-/// Provision this contact over a trusted channel. It carries no authority private key or bearer secret.
-#[derive(Clone, Debug)]
-pub struct PeerInvite {
-    pub realm_id: RealmId,
-    pub authority: EndpointId,
-    pub address: EndpointAddr,
-}
-impl PeerInvite {
-    /// Contact-only invitation, suitable for independently provisioned certificates.
-    pub fn encode(&self) -> Result<String> {
-        use base64::Engine;
-        let mut w = crate::cbor::Writer::new();
-        w.array(5);
-        w.u(1);
-        w.bytes(&self.realm_id);
-        w.bytes(self.authority.as_bytes());
-        w.bytes(self.address.id.as_bytes());
-        let addresses: Vec<String> = self
-            .address
-            .ip_addrs()
-            .map(|a| format!("ip:{a}"))
-            .chain(self.address.relay_urls().map(|a| format!("relay:{a}")))
-            .collect();
-        if addresses.len() > 16 {
-            return Err(Error::MessageTooLarge);
-        }
-        w.array(addresses.len());
-        for a in addresses {
-            if a.len() > 1024 {
-                return Err(Error::MessageTooLarge);
-            }
-            w.text(&a);
-        }
-        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(w.finish()))
-    }
-    pub fn decode(code: &str) -> Result<Self> {
-        use base64::Engine;
-        if code.len() > 24576 {
-            return Err(Error::MessageTooLarge);
-        }
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(code)
-            .map_err(|_| Error::Protocol("invite base64"))?;
-        let mut r = crate::cbor::Reader::new(&bytes);
-        r.array(5)?;
-        auth::version(r.u()?)?;
-        let realm_id = r.fixed()?;
-        let authority = auth::endpoint(r.fixed()?)?;
-        let mut address = EndpointAddr::new(auth::endpoint(r.fixed()?)?);
-        for _ in 0..r.list(16)? {
-            let a = r.text(1024)?;
-            if let Some(ip) = a.strip_prefix("ip:") {
-                address =
-                    address.with_ip_addr(ip.parse().map_err(|_| Error::Protocol("invite IP"))?);
-            } else if let Some(relay) = a.strip_prefix("relay:") {
-                address = address
-                    .with_relay_url(relay.parse().map_err(|_| Error::Protocol("invite relay"))?);
-            } else {
-                return Err(Error::Protocol("invite address type"));
-            }
-        }
-        r.end()?;
-        let invite = Self {
-            realm_id,
-            authority,
-            address,
-        };
-        if invite.encode()? != code {
-            return Err(Error::Protocol("noncanonical invite"));
-        }
-        Ok(invite)
+impl Default for Config {
+    fn default() -> Self {
+        Self::new()
     }
 }
+
+#[derive(Clone)]
+pub(crate) struct EndpointConfig {
+    pub settings: Config,
+    pub trust: Trust,
+}
+impl std::ops::Deref for EndpointConfig {
+    type Target = Config;
+    fn deref(&self) -> &Config {
+        &self.settings
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SubscriptionOptions {
     pub mode: DeliveryMode,
@@ -220,7 +162,7 @@ impl RecipientOutcome {
         !matches!(self, Self::Pending)
     }
 }
-struct ReceiptEntry {
+pub(crate) struct ReceiptEntry {
     peer: EndpointId,
     rx: watch::Receiver<RecipientOutcome>,
     _memory: Arc<Permit>,
@@ -297,7 +239,8 @@ struct Handle {
     pool: BufferPool,
     metadata: Arc<Budget>,
     cert: watch::Receiver<Certificate>,
-    trust: Trust,
+    config: EndpointConfig,
+    host: Option<EndpointId>,
     stop: CancellationToken,
     done: watch::Receiver<bool>,
 }
@@ -321,20 +264,96 @@ pub struct MessagingEndpoint {
     handle: Arc<Handle>,
 }
 impl MessagingEndpoint {
-    pub async fn start(
+    /// Create a realm and host. Only peers enrolled through this host's join codes are admitted.
+    pub async fn host(
         config: Config,
         identity: Identity,
-        certificate: Certificate,
+        permissions: Vec<Permission>,
     ) -> Result<Self> {
         config.validate()?;
-        config
-            .trust
-            .verify(&certificate, identity.endpoint_id(), auth::now()?)?;
+        let authority = Authority::generate();
+        let now = auth::now()?;
+        let certificate = authority.issue(
+            identity.endpoint_id(),
+            permissions,
+            now,
+            now + 86400,
+            CertificateLimits::default(),
+        )?;
+        let config = EndpointConfig {
+            settings: config,
+            trust: authority.trust(),
+        };
         let endpoint = transport::bind(&config, &identity).await?;
+        Self::start_bound(
+            config,
+            identity,
+            certificate,
+            endpoint,
+            crate::join::Admission::host(authority),
+            None,
+        )
+        .await
+    }
+
+    /// Enroll with a trusted join code and connect to its host. The identity's private key stays local.
+    pub async fn join(config: Config, identity: Identity, code: &JoinCode) -> Result<Self> {
+        config.validate()?;
+        if identity.endpoint_id() == code.host_id() {
+            return Err(Error::Unauthorized);
+        }
+        let config = EndpointConfig {
+            settings: config,
+            trust: code.trust(),
+        };
+        let endpoint = transport::bind(&config, &identity).await?;
+        let certificate = match crate::join::redeem(&endpoint, &config, code).await {
+            Ok(certificate) => certificate,
+            Err(error) => {
+                endpoint.close().await;
+                return Err(error);
+            }
+        };
+        let host = code.host_id();
+        let client = Self::start_bound(
+            config,
+            identity,
+            certificate,
+            endpoint,
+            crate::join::Admission::Client(host),
+            Some(host),
+        )
+        .await?;
+        if let Err(error) = client.connect_host(code.address.clone()).await {
+            let _ = client.shutdown(ShutdownMode::Immediate).await;
+            return Err(error);
+        }
+        Ok(client)
+    }
+
+    async fn start_bound(
+        config: EndpointConfig,
+        identity: Identity,
+        certificate: Certificate,
+        endpoint: Endpoint,
+        admission: crate::join::Admission,
+        host: Option<EndpointId>,
+    ) -> Result<Self> {
         let pool = BufferPool::new(config.payload_bytes, config.max_payload);
         let metadata = Budget::new(config.metadata_bytes);
-        let certificate = certificate.metered(&metadata)?;
-        let revocation_memory = metadata.reserve(config.trust.revoked_count() * 96)?;
+        let setup = (|| {
+            Ok::<_, Error>((
+                certificate.metered(&metadata)?,
+                metadata.reserve(config.trust.revoked_count() * 96)?,
+            ))
+        })();
+        let (certificate, revocation_memory) = match setup {
+            Ok(value) => value,
+            Err(error) => {
+                endpoint.close().await;
+                return Err(error);
+            }
+        };
         let (cert_updates, cert_rx) = watch::channel(certificate.clone());
         let (tx, rx) = mpsc::channel(config.ingress_slots);
         let stop = CancellationToken::new();
@@ -345,7 +364,8 @@ impl MessagingEndpoint {
             pool: pool.clone(),
             metadata: metadata.clone(),
             cert: cert_rx,
-            trust: config.trust.clone(),
+            config: config.clone(),
+            host,
             stop: stop.clone(),
             done,
         });
@@ -362,6 +382,7 @@ impl MessagingEndpoint {
                 tx,
                 rx,
                 stop,
+                admission,
             )
             .run()
             .await;
@@ -370,18 +391,56 @@ impl MessagingEndpoint {
         });
         Ok(Self { handle })
     }
+
+    /// Create a reusable, expiring join code. Only hosts can issue codes.
+    pub async fn issue_join_code(&self, options: JoinOptions) -> Result<JoinCode> {
+        options.validate()?;
+        self.handle
+            .request(|reply| Command::IssueCode { options, reply })
+            .await
+    }
+
+    /// Stop new enrollment and re-enrollment through a code; existing certificates remain valid.
+    pub async fn revoke_join_code(&self, id: [u8; 16]) -> Result<()> {
+        self.handle
+            .request(|reply| Command::RevokeCode { id, reply })
+            .await
+    }
+
+    /// Re-enroll and reconnect to the same host using a currently valid code.
+    /// Preserves identity, publisher epoch, subscriptions, and retained publications.
+    pub async fn rejoin(&self, code: &JoinCode) -> Result<()> {
+        if self.handle.host != Some(code.host_id())
+            || self.handle.config.trust.root() != code.authority()
+            || self.handle.config.trust.realm_id() != code.realm_id()
+        {
+            return Err(Error::Unauthorized);
+        }
+        let _memory = self.handle.metadata.reserve(128 * 1024)?;
+        let certificate =
+            crate::join::redeem(&self.handle.endpoint, &self.handle.config, code).await?;
+        self.handle
+            .request(|reply| Command::Renew { certificate, reply })
+            .await?;
+        self.connect_host(code.address.clone()).await
+    }
+
+    /// Current authorization, useful for identifying a certificate to revoke.
+    pub fn certificate(&self) -> Certificate {
+        self.handle.cert.borrow().clone()
+    }
+
+    async fn connect_host(&self, address: EndpointAddr) -> Result<()> {
+        self.handle
+            .request(|reply| Command::Connect { address, reply })
+            .await
+    }
+
     pub fn endpoint_id(&self) -> EndpointId {
         self.handle.endpoint.id()
     }
     pub fn buffers(&self) -> &BufferPool {
         &self.handle.pool
-    }
-    pub fn invite(&self) -> PeerInvite {
-        PeerInvite {
-            realm_id: self.handle.trust.realm_id(),
-            authority: self.handle.trust.root(),
-            address: self.handle.endpoint.addr(),
-        }
     }
     /// Wait up to `timeout` for a relay connection.
     pub async fn online(&self, timeout: Duration) -> Result<()> {
@@ -389,12 +448,6 @@ impl MessagingEndpoint {
             .await
             .map_err(|_| Error::Timeout)?;
         Ok(())
-    }
-    pub async fn connect(&self, invite: PeerInvite) -> Result<()> {
-        invite.encode()?; // Bound contact material before enqueueing it.
-        self.handle
-            .request(|reply| Command::Connect { invite, reply })
-            .await
     }
     pub async fn disconnect(&self, peer: EndpointId) -> Result<()> {
         self.handle
@@ -431,13 +484,6 @@ impl MessagingEndpoint {
             topic,
             handle: self.handle.clone(),
         })
-    }
-    /// Replace local authorization, preserving the endpoint key, publisher epoch, pending messages,
-    /// and still-authorized subscription IDs. Reconnect peers to exchange the new certificate.
-    pub async fn renew(&self, certificate: Certificate) -> Result<()> {
-        self.handle
-            .request(|reply| Command::Renew { certificate, reply })
-            .await
     }
     pub async fn deny_certificate(&self, id: Id) -> Result<()> {
         self.handle
