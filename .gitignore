@@ -1,0 +1,5 @@
+/target/
+
+# One-use enrollment files created by the quick start.
+/peer-setup*.cbor
+/lan-setup*.cbor
