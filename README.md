@@ -60,6 +60,8 @@ async fn example() -> Result<()> {
 
 `host.revoke_join_code(code.id())` blocks future enrollment through that code. Existing certificates remain valid. `deny_certificate(id)` separately rejects an enrolled certificate, including active and retained deliveries. A joining peer cannot issue codes. The host verifies that each connecting certificate was actually registered through its join flow.
 
+For restartable services, `MessagingEndpoint::host_persistent` atomically stores the realm authority, join grants, redeemed identities, and issued membership certificates in a private application file. Persist the host's transport identity separately with `Identity::save`/`load`, and reuse both paths after restart. The persistent directory and files must be private on Unix. This makes a one-use code reusable only by the same enrolled endpoint identity after either side restarts.
+
 Compact v3 codes take 161 characters with the standard relay URL used in the guide, or 121 with one IPv4 address, including the URI prefix. They carry the full host key and 256-bit secret; longer URLs or extra routes increase their length. Relay-backed codes need the relay for initial contact; direct-only configurations retain binary IP hints. Code versions 1 and 2 are unsupported: upgrade both sides and generate fresh codes. Rejoining preserves the authority and realm established at the first join.
 
 This is a breaking API change: raw contact invites, standalone enrollment services, externally provisioned endpoint startup, and direct-address connection methods have been removed. There are no compatibility wrappers. Rejoin uses a join code as well.
@@ -76,7 +78,7 @@ This is a breaking API change: raw contact invites, standalone enrollment servic
 
 Only host-to-joined-peer connections are supported. There is no peer discovery, membership directory, forwarding, or automatic B-to-C connection. No broker routes messages between joined peers.
 
-Host authority keys, join-code state, certificates, queues, and replay state are in memory. Restarting a host creates a new realm and invalidates its old codes. Host certificates last 24 hours; issued certificates cannot outlive them. Restart/re-enroll for a new host lifetime. Applications may persist endpoint identities with `Identity::save`/`load` on Unix, but this does not persist host membership or message state. Durability and io_uring remain optional future work.
+`MessagingEndpoint::host` remains memory-only and creates a new realm after restart. `host_persistent` recovers authority, grant, redemption, and membership state, but subscriptions, queued messages, delivery receipts, deduplication history, and runtime revocation snapshots remain in memory. Host and join lifetimes may be configured up to ten years; applications must still reconnect and re-enroll before credentials expire. Durable messaging queues and io_uring remain optional future work.
 
 ## Validate and measure
 

@@ -11,6 +11,7 @@ use owner::Command;
 use std::{
     collections::BTreeMap,
     net::SocketAddr,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicU8, Ordering},
@@ -270,30 +271,59 @@ impl MessagingEndpoint {
         identity: Identity,
         permissions: Vec<Permission>,
     ) -> Result<Self> {
-        config.validate()?;
-        let authority = Authority::generate();
-        let now = auth::now()?;
-        let certificate = authority.issue(
-            identity.endpoint_id(),
-            permissions,
-            now,
-            now + 86400,
-            CertificateLimits::default(),
-        )?;
-        let config = EndpointConfig {
-            settings: config,
-            trust: authority.trust(),
-        };
-        let endpoint = transport::bind(&config, &identity).await?;
-        Self::start_bound(
+        Self::host_with_admission(
             config,
             identity,
-            certificate,
-            endpoint,
-            crate::join::Admission::host(authority),
-            None,
+            permissions,
+            crate::join::Admission::host(Authority::generate()),
         )
         .await
+    }
+
+    /// Create or resume a host whose authority, join grants, and issued membership records
+    /// are atomically persisted in a private application state file.
+    pub async fn host_persistent(
+        config: Config,
+        identity: Identity,
+        permissions: Vec<Permission>,
+        state_path: impl AsRef<Path>,
+    ) -> Result<Self> {
+        Self::host_with_admission(
+            config,
+            identity,
+            permissions,
+            crate::join::Admission::persistent(state_path)?,
+        )
+        .await
+    }
+
+    async fn host_with_admission(
+        config: Config,
+        identity: Identity,
+        permissions: Vec<Permission>,
+        admission: crate::join::Admission,
+    ) -> Result<Self> {
+        config.validate()?;
+        let now = auth::now()?;
+        let (certificate, trust) = {
+            let authority = admission.authority()?;
+            (
+                authority.issue(
+                    identity.endpoint_id(),
+                    permissions,
+                    now,
+                    now + crate::join::MAX_JOIN_LIFETIME.as_secs(),
+                    CertificateLimits::default(),
+                )?,
+                authority.trust(),
+            )
+        };
+        let config = EndpointConfig {
+            settings: config,
+            trust,
+        };
+        let endpoint = transport::bind(&config, &identity).await?;
+        Self::start_bound(config, identity, certificate, endpoint, admission, None).await
     }
 
     /// Enroll with a trusted join code and connect to its host. The identity's private key stays local.
@@ -337,11 +367,15 @@ impl MessagingEndpoint {
         identity: Identity,
         certificate: Certificate,
         endpoint: Endpoint,
-        admission: crate::join::Admission,
+        mut admission: crate::join::Admission,
         host: Option<EndpointId>,
     ) -> Result<Self> {
         let pool = BufferPool::new(config.payload_bytes, config.max_payload);
         let metadata = Budget::new(config.metadata_bytes);
+        if let Err(error) = admission.meter(&metadata) {
+            endpoint.close().await;
+            return Err(error);
+        }
         let setup = (|| {
             Ok::<_, Error>((
                 certificate.metered(&metadata)?,

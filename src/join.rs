@@ -10,9 +10,14 @@ use crate::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use iroh::{Endpoint, EndpointAddr, endpoint::Connection};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::{
     collections::BTreeMap,
+    fs::{self, OpenOptions},
+    io::Write,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -22,6 +27,7 @@ use tokio::{
 };
 pub(crate) const ALPN: &[u8] = b"iroh-mq/join/2";
 const PREFIX: &str = "rtn-mq://join/";
+pub const MAX_JOIN_LIFETIME: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
 
 /// Permission and registration limits attached to a reusable code.
 #[derive(Clone, Debug)]
@@ -46,9 +52,9 @@ impl JoinOptions {
     pub(crate) fn validate(&self) -> Result<()> {
         if self.permissions.len() > MAX_PERMISSIONS
             || self.lifetime.as_secs() == 0
-            || self.lifetime > Duration::from_secs(86400)
+            || self.lifetime > MAX_JOIN_LIFETIME
             || self.certificate_lifetime.as_secs() == 0
-            || self.certificate_lifetime > Duration::from_secs(86400)
+            || self.certificate_lifetime > MAX_JOIN_LIFETIME
             || !(1..=256).contains(&self.max_uses)
         {
             return Err(Error::Config("invalid join code limits"));
@@ -194,11 +200,11 @@ struct Grant {
     expires: u64,
     options: JoinOptions,
     redeemed: BTreeMap<EndpointId, Certificate>,
-    _memory: Permit,
+    _memory: Option<Permit>,
 }
 struct Member {
     certificate: Certificate,
-    _memory: Permit,
+    _memory: Option<Permit>,
 }
 pub(crate) enum Admission {
     Host(Box<Host>),
@@ -208,14 +214,353 @@ pub(crate) struct Host {
     authority: Authority,
     codes: BTreeMap<[u8; 16], Grant>,
     members: BTreeMap<[u8; 16], Member>,
+    storage: Option<PersistentFile>,
 }
-impl Admission {
-    pub fn host(authority: Authority) -> Self {
-        Self::Host(Box::new(Host {
+
+#[derive(Clone)]
+struct PersistentFile {
+    path: PathBuf,
+}
+
+impl PersistentFile {
+    const MAX_BYTES: usize = 4 * 1024 * 1024;
+
+    fn new(path: impl AsRef<Path>) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+        }
+    }
+
+    fn load(&self) -> Result<Option<Vec<u8>>> {
+        let parent = self.parent();
+        if parent.exists() {
+            Self::validate_parent(parent)?;
+        }
+        let metadata = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Self::validate_file(&metadata)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW);
+        let file = options.open(&self.path)?;
+        Self::validate_file(&file.metadata()?)?;
+        let mut bytes = Vec::new();
+        use std::io::Read;
+        file.take((Self::MAX_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > Self::MAX_BYTES {
+            return Err(Error::MessageTooLarge);
+        }
+        Ok(Some(bytes))
+    }
+
+    fn save(&self, bytes: &[u8]) -> Result<()> {
+        if bytes.len() > Self::MAX_BYTES {
+            return Err(Error::MessageTooLarge);
+        }
+        let parent = self.parent();
+        let parent_existed = parent.exists();
+        fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        if !parent_existed {
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
+        Self::validate_parent(parent)?;
+        if let Ok(metadata) = fs::symlink_metadata(&self.path) {
+            Self::validate_file(&metadata)?;
+        }
+        let temporary = parent.join(format!(".rtn-mq-state-{:032x}", rand::random::<u128>()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let result = (|| {
+            let mut file = options.open(&temporary)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            fs::rename(&temporary, &self.path)?;
+            #[cfg(unix)]
+            fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))?;
+            fs::File::open(parent)?.sync_all()?;
+            Ok::<(), Error>(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(temporary);
+        }
+        result
+    }
+
+    fn parent(&self) -> &Path {
+        self.path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+    }
+
+    fn validate_parent(metadata_path: &Path) -> Result<()> {
+        let metadata = fs::symlink_metadata(metadata_path)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(Error::Config(
+                "persistent-state directory must be a real directory",
+            ));
+        }
+        #[cfg(unix)]
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(Error::Config(
+                "persistent-state directory must be private (0700)",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_file(metadata: &fs::Metadata) -> Result<()> {
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(Error::Config(
+                "persistent state must be a private regular file",
+            ));
+        }
+        #[cfg(unix)]
+        if metadata.nlink() != 1 || metadata.permissions().mode() & 0o077 != 0 {
+            return Err(Error::Config(
+                "persistent state must be an unlinked private (0600) file",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Host {
+    fn new(authority: Authority, storage: Option<PersistentFile>) -> Self {
+        Self {
             authority,
             codes: BTreeMap::new(),
             members: BTreeMap::new(),
-        }))
+            storage,
+        }
+    }
+
+    fn encode_permission(writer: &mut Writer, permission: &Permission) {
+        writer.array(2);
+        writer.text(permission.topic.as_str());
+        writer.u(u64::from(permission.publish) | (u64::from(permission.subscribe) << 1));
+    }
+
+    fn decode_permission(reader: &mut Reader<'_>) -> Result<Permission> {
+        reader.array(2)?;
+        let topic = Topic::new(reader.text(256)?)?;
+        match reader.u()? {
+            1 => Permission::publish(topic.as_str()),
+            2 => Permission::subscribe(topic.as_str()),
+            3 => Permission::both(topic.as_str()),
+            _ => Err(Error::Protocol("persistent permission mask")),
+        }
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut writer = Writer::new();
+        writer.array(6);
+        writer.u(1);
+        writer.bytes(&self.authority.secret_bytes());
+        writer.bytes(&self.authority.realm_id());
+        writer.array(self.codes.len());
+        for (id, grant) in &self.codes {
+            writer.array(9);
+            writer.bytes(id);
+            writer.bytes(&grant.hash);
+            writer.u(grant.expires);
+            writer.u(grant.options.lifetime.as_secs());
+            writer.u(grant.options.certificate_lifetime.as_secs());
+            writer.u(grant.options.max_uses as u64);
+            writer.array(2);
+            writer.u(grant.options.limits.max_payload);
+            writer.u(grant.options.limits.max_subscriptions);
+            writer.array(grant.options.permissions.len());
+            for permission in &grant.options.permissions {
+                Self::encode_permission(&mut writer, permission);
+            }
+            writer.array(grant.redeemed.len());
+            for (endpoint, certificate) in &grant.redeemed {
+                writer.array(2);
+                writer.bytes(endpoint.as_bytes());
+                writer.bytes(certificate.as_bytes());
+            }
+        }
+        writer.array(self.members.len());
+        for member in self.members.values() {
+            writer.bytes(member.certificate.as_bytes());
+        }
+        // Reserved for additive state that can be introduced in a new format version.
+        writer.array(0);
+        writer.finish()
+    }
+
+    fn decode(bytes: &[u8], storage: PersistentFile) -> Result<Self> {
+        let mut reader = Reader::new(bytes);
+        reader.array(6)?;
+        if reader.u()? != 1 {
+            return Err(Error::Protocol("persistent-state version"));
+        }
+        let authority = Authority::from_parts(reader.fixed()?, reader.fixed()?);
+        let trust = authority.trust();
+        let code_count = reader.list(256)?;
+        let mut codes = BTreeMap::new();
+        for _ in 0..code_count {
+            reader.array(9)?;
+            let id = reader.fixed()?;
+            let hash = reader.fixed()?;
+            let expires = reader.u()?;
+            let lifetime = Duration::from_secs(reader.u()?);
+            let certificate_lifetime = Duration::from_secs(reader.u()?);
+            let max_uses =
+                usize::try_from(reader.u()?).map_err(|_| Error::Protocol("persistent max uses"))?;
+            reader.array(2)?;
+            let limits = CertificateLimits {
+                max_payload: reader.u()?,
+                max_subscriptions: reader.u()?,
+            };
+            let permission_count = reader.list(MAX_PERMISSIONS)?;
+            let mut permissions = Vec::with_capacity(permission_count);
+            for _ in 0..permission_count {
+                permissions.push(Self::decode_permission(&mut reader)?);
+            }
+            let options = JoinOptions {
+                permissions,
+                limits,
+                lifetime,
+                certificate_lifetime,
+                max_uses,
+            };
+            options.validate()?;
+            let redeemed_count = reader.list(256)?;
+            let mut redeemed = BTreeMap::new();
+            for _ in 0..redeemed_count {
+                reader.array(2)?;
+                let endpoint = auth::endpoint(reader.fixed()?)?;
+                let certificate = Certificate::from_bytes(reader.bytes(MAX_CERT)?)?;
+                match trust.verify(&certificate, endpoint, auth::now()?) {
+                    Ok(()) | Err(Error::CertificateExpired) => {}
+                    Err(error) => return Err(error),
+                }
+                if redeemed.insert(endpoint, certificate).is_some() {
+                    return Err(Error::Protocol("duplicate persisted endpoint"));
+                }
+            }
+            if redeemed.len() > options.max_uses
+                || codes
+                    .insert(
+                        id,
+                        Grant {
+                            hash,
+                            expires,
+                            options,
+                            redeemed,
+                            _memory: None,
+                        },
+                    )
+                    .is_some()
+            {
+                return Err(Error::Protocol("duplicate or overused persisted code"));
+            }
+        }
+        let member_count = reader.list(256)?;
+        let mut members = BTreeMap::new();
+        let now = auth::now()?;
+        for _ in 0..member_count {
+            let certificate = Certificate::from_bytes(reader.bytes(MAX_CERT)?)?;
+            match trust.verify(&certificate, certificate.endpoint_id(), now) {
+                Ok(()) | Err(Error::CertificateExpired) => {
+                    if members
+                        .insert(
+                            certificate.id(),
+                            Member {
+                                certificate,
+                                _memory: None,
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(Error::Protocol("duplicate persisted certificate"));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if reader.list(0)? != 0 {
+            return Err(Error::Protocol("persistent-state reserved fields"));
+        }
+        reader.end()?;
+        let host = Self {
+            authority,
+            codes,
+            members,
+            storage: Some(storage),
+        };
+        crate::cbor::canonical(bytes, &host.encode())?;
+        Ok(host)
+    }
+
+    fn persist(&self) -> Result<()> {
+        if let Some(storage) = &self.storage {
+            storage.save(&self.encode())?;
+        }
+        Ok(())
+    }
+
+    fn meter(&mut self, budget: &Arc<Budget>) -> Result<()> {
+        for grant in self.codes.values_mut() {
+            if grant._memory.is_none() {
+                grant._memory = Some(
+                    budget.reserve(
+                        1024 + grant
+                            .options
+                            .permissions
+                            .iter()
+                            .map(|permission| permission.topic.as_str().len() + 128)
+                            .sum::<usize>(),
+                    )?,
+                );
+            }
+        }
+        for member in self.members.values_mut() {
+            if member._memory.is_none() {
+                member._memory = Some(budget.reserve(1024)?);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Admission {
+    pub fn host(authority: Authority) -> Self {
+        Self::Host(Box::new(Host::new(authority, None)))
+    }
+    pub fn persistent(path: impl AsRef<Path>) -> Result<Self> {
+        let storage = PersistentFile::new(path);
+        let host = match storage.load()? {
+            Some(bytes) => Host::decode(&bytes, storage)?,
+            None => {
+                let host = Host::new(Authority::generate(), Some(storage));
+                host.persist()?;
+                host
+            }
+        };
+        Ok(Self::Host(Box::new(host)))
+    }
+    pub fn authority(&self) -> Result<&Authority> {
+        match self {
+            Self::Host(host) => Ok(&host.authority),
+            Self::Client(_) => Err(Error::Unauthorized),
+        }
+    }
+    pub fn meter(&mut self, budget: &Arc<Budget>) -> Result<()> {
+        if let Self::Host(host) = self {
+            host.meter(budget)?;
+        }
+        Ok(())
     }
     pub fn can_dial(&self, peer: EndpointId) -> bool {
         matches!(self, Self::Client(host) if *host == peer)
@@ -277,9 +622,10 @@ impl Admission {
                 expires,
                 options,
                 redeemed: BTreeMap::new(),
-                _memory: memory,
+                _memory: Some(memory),
             },
         );
+        host.persist()?;
         Ok(code)
     }
     pub fn revoke_code(&mut self, id: [u8; 16]) -> Result<()> {
@@ -287,6 +633,7 @@ impl Admission {
             return Err(Error::Unauthorized);
         };
         host.codes.remove(&id);
+        host.persist()?;
         Ok(())
     }
     #[allow(clippy::too_many_arguments)]
@@ -306,7 +653,7 @@ impl Admission {
         };
         host.members
             .retain(|_, member| member.certificate.expires_at() > now);
-        let grant = host.codes.get_mut(&id).ok_or(Error::Unauthorized)?;
+        let grant = host.codes.get(&id).ok_or(Error::Unauthorized)?;
         if grant.expires <= now || grant.hash != digest(&secret) {
             return Err(Error::Unauthorized);
         }
@@ -328,15 +675,19 @@ impl Admission {
         if host.members.len() >= max_members {
             return Err(Error::QueueFull);
         }
+        let permissions = grant.options.permissions.clone();
+        let certificate_lifetime = grant.options.certificate_lifetime;
+        let limits = grant.options.limits;
+        let grant_expires = grant.expires;
         let memory = budget.reserve(1024)?;
         let cert = host
             .authority
             .issue(
                 peer,
-                grant.options.permissions.clone(),
+                permissions,
                 now,
-                (now + grant.options.certificate_lifetime.as_secs()).min(host_expires),
-                grant.options.limits,
+                (now + certificate_lifetime.as_secs()).min(host_expires),
+                limits,
             )?
             .metered(budget)?;
         // The owner atomically records admission and the cached reply before returning success.
@@ -344,13 +695,18 @@ impl Admission {
             cert.id(),
             Member {
                 certificate: cert.clone(),
-                _memory: memory,
+                _memory: Some(memory),
             },
         );
-        grant.redeemed.insert(peer, cert.clone());
+        host.codes
+            .get_mut(&id)
+            .expect("grant checked above")
+            .redeemed
+            .insert(peer, cert.clone());
+        host.persist()?;
         Ok(Enrollment {
             trust: host.authority.trust(),
-            expires: grant.expires,
+            expires: grant_expires,
             certificate: cert,
         })
     }
@@ -534,6 +890,18 @@ pub(crate) async fn serve(conn: Connection, tx: mpsc::Sender<Command>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_credentials_allow_ten_years_but_not_longer() {
+        let permissions = vec![Permission::publish("service").unwrap()];
+        let mut options = JoinOptions::new(permissions);
+        options.lifetime = MAX_JOIN_LIFETIME;
+        options.certificate_lifetime = MAX_JOIN_LIFETIME;
+        assert!(options.validate().is_ok());
+        options.lifetime += Duration::from_secs(1);
+        assert!(options.validate().is_err());
+    }
+
     #[test]
     fn independent_join_code_fixture_matches_the_public_encoding() {
         let bytes: Vec<u8> = include_str!("../tests/fixtures/join.hex")

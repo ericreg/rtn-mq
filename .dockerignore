@@ -1,0 +1,4 @@
+.git
+target
+*.profraw
+**/.DS_Store

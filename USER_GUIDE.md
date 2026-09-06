@@ -188,8 +188,8 @@ Run the subscriber's receive loop while publishers are waiting. Decode the CBOR 
 | Setting or operation | Meaning |
 |---|---|
 | `JoinOptions::permissions` | Exact topics the joining endpoint may publish or subscribe to. |
-| `lifetime` | How long the code admits registrations/rejoins: 1 second–24 hours. Default one hour. |
-| `certificate_lifetime` | Certificate validity after issuance: 1 second–24 hours, capped by host certificate expiry. Default one hour. |
+| `lifetime` | How long the code admits registrations/rejoins: 1 second–10 years. Default one hour. |
+| `certificate_lifetime` | Certificate validity after issuance: 1 second–10 years, capped by host certificate expiry. Default one hour. |
 | `max_uses` | Distinct identities admitted by this code: 1–256. Default 256. Same-key recovery of a valid grant does not consume another use. |
 | `limits` | Optional restrictions on the joining peer's payload size and subscription count. |
 | `host.revoke_join_code(code.id())` | Disable future enrollment through that code. Existing certificates and sessions remain valid. |
@@ -205,7 +205,9 @@ Keep the same `MessagingEndpoint` and call `peer.rejoin(&code).await?` after a c
 
 `rejoin` preserves the running endpoint's identity, publisher epoch, retained message IDs, and still-authorized subscriptions. It retrieves a cached valid certificate or renews an expired grant; changing code permissions is enforced when the replacement authorization is installed. Failed enrollment leaves the previous authorization in place. Expiring/revoking a code does not itself revoke previously issued certificates, but a new valid code is required for a subsequent rejoin.
 
-State is memory-only. The host's root key and realm are generated when it starts; restarting it invalidates old codes and membership. The host's certificate lasts 24 hours, and its issued certificates cannot outlive it. Start a new host lifetime and re-enroll clients when that expires. `Identity::save`/`load` can retain a peer's identity in a private Unix key file; this does not persist host membership, subscriptions, or queued messages. Other platforms use application-managed key stores.
+`MessagingEndpoint::host` is memory-only: its root key and realm are generated when it starts, so restarting it invalidates old codes and membership. For a restartable host, use `MessagingEndpoint::host_persistent(config, identity, permissions, state_path)` and reuse an identity loaded with `Identity::load`. It atomically recovers the authority, join grants, redeemed endpoint identities, and membership certificates. The state and identity directories/files must be private on Unix.
+
+Persistent enrollment is not a durable message queue. Subscriptions, queued publications, receipt state, deduplication history, and runtime revocation snapshots still reset with the process. Host and issued-certificate lifetimes can be at most ten years; re-enroll before expiry. Other platforms use application-managed key stores.
 
 To disconnect a session, use `endpoint.disconnect(peer_id).await?`. It does not create a new connection path; reconnect through `rejoin(&code)`.
 

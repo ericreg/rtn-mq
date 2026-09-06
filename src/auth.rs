@@ -199,6 +199,15 @@ impl Authority {
             realm: rand::random(),
         }
     }
+    pub(crate) fn from_parts(secret: [u8; 32], realm: RealmId) -> Self {
+        Self {
+            key: SecretKey::from_bytes(&secret),
+            realm,
+        }
+    }
+    pub(crate) fn secret_bytes(&self) -> [u8; 32] {
+        self.key.to_bytes()
+    }
     #[cfg(test)]
     pub fn from_identity(identity: crate::Identity, realm: RealmId) -> Self {
         Self {

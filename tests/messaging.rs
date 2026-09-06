@@ -76,6 +76,89 @@ async fn close(a: &MessagingEndpoint, b: &MessagingEndpoint) {
 }
 
 #[tokio::test]
+async fn persistent_host_recovers_one_use_membership_after_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let private = directory.path().join("private");
+    let state_path = private.join("host.cbor");
+    let host_identity = Identity::generate();
+    let gateway_identity = Identity::generate();
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap();
+    drop(socket);
+
+    let mut host_config = config();
+    host_config.bind_addr = Some(address);
+    let host = MessagingEndpoint::host_persistent(
+        host_config.clone(),
+        host_identity.clone(),
+        vec![Permission::publish("responses").unwrap()],
+        &state_path,
+    )
+    .await
+    .unwrap();
+    let mut options = JoinOptions::new(vec![Permission::subscribe("responses").unwrap()]);
+    options.max_uses = 1;
+    options.lifetime = Duration::from_secs(60);
+    options.certificate_lifetime = Duration::from_secs(60);
+    let code = host.issue_join_code(options).await.unwrap();
+    let gateway = MessagingEndpoint::join(config(), gateway_identity.clone(), &code)
+        .await
+        .unwrap();
+    assert!(matches!(
+        MessagingEndpoint::join(config(), Identity::generate(), &code).await,
+        Err(Error::QueueFull)
+    ));
+    close(&host, &gateway).await;
+    drop(host);
+    drop(gateway);
+
+    let host = MessagingEndpoint::host_persistent(
+        host_config,
+        host_identity,
+        vec![Permission::publish("responses").unwrap()],
+        &state_path,
+    )
+    .await
+    .unwrap();
+    let gateway = MessagingEndpoint::join(config(), gateway_identity, &code)
+        .await
+        .unwrap();
+    assert!(matches!(
+        MessagingEndpoint::join(config(), Identity::generate(), &code).await,
+        Err(Error::QueueFull)
+    ));
+    close(&host, &gateway).await;
+    assert!(std::fs::metadata(state_path).unwrap().len() > 64);
+}
+
+#[tokio::test]
+async fn burst_publications_do_not_lose_receive_credit_requests() {
+    let (publisher, receiver, mut sub) = pair().await;
+    let topic = publisher.publisher("jobs").unwrap();
+    let mut receipts = Vec::new();
+    // Queue messages without waiting for previous processing receipts. DATA and
+    // the next credit request travel on different QUIC streams and can race.
+    for _ in 0..12 {
+        receipts.push(
+            topic
+                .publish(publisher.buffers().copy_from_slice(b"burst").unwrap(), options())
+                .await
+                .unwrap(),
+        );
+    }
+    for _ in 0..receipts.len() {
+        delivery(&mut sub).await.ack().await.unwrap();
+    }
+    for mut receipt in receipts {
+        assert_eq!(
+            receipt.wait_for_processing(wait_timeout()).await.unwrap()[0].1,
+            RecipientOutcome::Processed
+        );
+    }
+    close(&publisher, &receiver).await;
+}
+
+#[tokio::test]
 async fn direct_signed_delivery_and_processing_receipt() {
     let (a, b, mut sub) = pair().await;
     let mut receipt = a

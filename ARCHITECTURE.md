@@ -1,7 +1,7 @@
 # Iroh Brokerless Messaging
 ## Architecture and Version 1 Protocol
 
-**Status:** Breaking join-code-only, memory-only Rust baseline implemented; optional durability and storage extensions remain unimplemented  
+**Status:** Breaking join-code-only Rust baseline implemented; optional persistent host enrollment is available, while durable message queues remain unimplemented
 **Date:** September 4, 2026  
 **Implementation language:** Rust  
 **Deployment model:** An embedded messaging endpoint in each application
@@ -62,7 +62,7 @@ A topic is not a durable log. A disconnected subscriber does not automatically r
 
 ### Host and realm authority
 
-`MessagingEndpoint::host` creates a new authority and realm, signs a 24-hour certificate for its independent transport identity, and starts the endpoint owner. `issue_join_code` associates permissions, expiry, certificate lifetime, and a distinct-registration limit with a random secret. Only hosts can issue codes.
+`MessagingEndpoint::host` creates a new authority and realm, signs a bounded-lifetime certificate for its independent transport identity, and starts the endpoint owner. `MessagingEndpoint::host_persistent` instead recovers or atomically creates private authority, grant, redemption, and membership state. `issue_join_code` associates permissions, expiry, certificate lifetime, and a distinct-registration limit with a random secret. Only hosts can issue codes.
 
 `MessagingEndpoint::join` generates no remote keys: the caller supplies its own `Identity`. The code pins the initial trusted host. Only after authenticating it does the joining endpoint accept the root and realm supplied in its enrollment response. The joining endpoint redeems the secret against the authenticated host, verifies its certificate, and establishes a messaging session. `rejoin(&code)` repeats this flow against the same host while preserving local delivery state and the previously established root/realm. A response that changes either is rejected. Every establishment/re-establishment originates from a valid join code.
 
@@ -127,11 +127,11 @@ The only public bootstrap is a `JoinCode`. Its trusted delivery pins the host id
 
 The host owner stores the secret hash, fixed permissions/limits, expiry, maximum uses, and a cache indexed by the authenticated joining endpoint ID. Different identities receive distinct certificates. The same identity recovers its still-valid cached certificate without using another registration; an expired grant may be renewed while the code is valid. Concurrent redemptions are serialized with issuance and membership registration before returning success. Revoked certificates are not recovered through their cached grant.
 
-Defaults are one-hour code lifetime, one-hour certificate lifetime, and 256 distinct registrations per code. Lifetimes are 1 second–24 hours; maximum uses are 1–256. Issued certificates cannot outlive the host's 24-hour certificate. The host checks the stored expiry and secret hash. On success, clients also check the expiry returned in its authenticated response. Codes contain no offline expiry metadata; an expired/pruned grant is rejected by the host as `Unauthorized`. Editing a code does not extend its host-side policy.
+Defaults are one-hour code lifetime, one-hour certificate lifetime, and 256 distinct registrations per code. Lifetimes are 1 second–10 years; maximum uses are 1–256. Issued certificates cannot outlive the host certificate. The host checks the stored expiry and secret hash. On success, clients also check the expiry returned in its authenticated response. Codes contain no offline expiry metadata; an expired/pruned grant is rejected by the host as `Unauthorized`. Editing a code does not extend its host-side policy.
 
 Active codes are bounded by `Config::max_topics`; unexpired issued-certificate records by `max_peers`; all retained state is metered against metadata limits. Membership records remain after disconnect and code expiry so connection admission and accounting cannot be bypassed. Expiring/revoking a code disables future enrollment through it; `deny_certificate` independently revokes an issued member certificate.
 
-Host keys, grants, counters, membership records, and replay state are in memory. Restart creates a new realm and invalidates old codes. Durable host identity and enrollment recovery require a future storage design. Persisting only an endpoint `Identity` does not preserve host membership.
+The default host keeps authority, grants, counters, membership records, and replay state in memory; restart creates a new realm and invalidates old codes. The optional persistent host stores authority, grants, redeemed identity counters, and membership records atomically in a bounded private file. The transport `Identity` remains a separate private file. Replay, subscription, queue, receipt, and revocation-snapshot state remains process-local.
 
 ### 4.3 Connection authorization
 
@@ -688,7 +688,7 @@ The baseline also implements metered shared payload leases and `rtrb` SPSC rings
 
 The implementation caps inline payloads at 1 MiB and metadata at 16 KiB. Queues and certificate/delivery state are charged to configured budgets before admission. Payload charges include backing capacity plus a conservative 256-byte ownership allowance; receive grants reserve the maximum payload plus this allowance. Queue storage stays charged until both queue endpoints are dropped. Certificate accounting survives session replacement and retained deliveries. Deduplication records remain bounded and are retained through the message expiry horizon. Terminal receipt history adds one handshake-timeout grace period to tolerate late acknowledgements. Receive grants also reserve the future deduplication record before advertising capacity. A receiver uses QUIC STOP_SENDING code 1 when a subscription closes before DATA admission; this retires the topic stream without closing unrelated streams. Expired in-flight messages are discarded with a permanent NACK. Metrics expose current/high-water charges and unfinished shutdown deliveries; they are not a process-RSS bound.
 
-Private-key persistence is implemented for Unix with explicit private-directory/file checks and atomic replacement. Other platforms use application-provided key stores. Enrollment, queues, replay state, and revocation version state remain in memory. Restart-resistant revocation rollback protection requires application-managed trust-state persistence.
+Private-key persistence is implemented for Unix with explicit private-directory/file checks and atomic replacement. Persistent host enrollment uses the same private-file posture and recovers authority, join grants, redemptions, and memberships. Other platforms use application-provided key stores. Queues, subscriptions, replay state, and runtime revocation version state remain in memory. Restart-resistant revocation rollback protection still requires application-managed trust-state persistence.
 
 The suite includes direct and relay-only two/three-peer tests, a real stolen-certificate handshake, authenticated bootstrap fixtures and certificate validation, rejoin rejection after same-key host realm replacement, unaddressed ACK rejection, reusable-code enrollment races, usage limits, code revocation, and same-key response recovery, renewal, active/disconnected revocation, expiry, partial fan-out, abandoned processing, lost ACK recovery, and budget retention across reconnects. The local relay test disables direct IP transports, so a direct connection cannot accidentally satisfy it. No durability or io_uring storage claim is made.
 

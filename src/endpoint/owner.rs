@@ -898,7 +898,11 @@ impl Owner {
                     if bytes == 0 {
                         s.grants.remove(&peer);
                         s.demand.remove(&peer);
-                    } else if !s.grants.contains_key(&peer) {
+                    } else {
+                        // The sender can consume its grant and request the next
+                        // one before DATA arrives on the separate data stream.
+                        // Retain that demand until begin() consumes our grant.
+                        // grant_credits() still allows only one unused grant.
                         s.demand.insert(peer, bytes);
                     }
                     self.pool.budget.wake.notify_one();
