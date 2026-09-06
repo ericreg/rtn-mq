@@ -30,6 +30,14 @@ impl Identity {
     pub fn from_secret_key(key: SecretKey) -> Self {
         Self(key)
     }
+    /// Restore an identity from an application-managed private key store.
+    pub fn from_bytes(bytes: &[u8; 32]) -> Self {
+        Self(SecretKey::from_bytes(bytes))
+    }
+    /// Export the private key. The caller must keep these bytes confidential.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.0.to_bytes()
+    }
     pub fn endpoint_id(&self) -> EndpointId {
         self.0.public()
     }

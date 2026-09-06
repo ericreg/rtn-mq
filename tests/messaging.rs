@@ -76,6 +76,69 @@ async fn close(a: &MessagingEndpoint, b: &MessagingEndpoint) {
 }
 
 #[tokio::test]
+async fn readiness_requires_both_topics_and_clears_on_disconnect() {
+    let server = host(
+        vec![
+            Permission::publish("responses").unwrap(),
+            Permission::subscribe("requests").unwrap(),
+        ],
+        config(),
+    )
+    .await;
+    let client = member(
+        &server,
+        vec![
+            Permission::publish("requests").unwrap(),
+            Permission::subscribe("responses").unwrap(),
+        ],
+        config(),
+    )
+    .await;
+    assert!(
+        !client
+            .topics_ready(server.endpoint_id(), "requests", "responses")
+            .await
+            .unwrap()
+    );
+    let mut responses = client
+        .subscribe("responses", SubscriptionOptions::acknowledged())
+        .await
+        .unwrap();
+    responses
+        .wait_ready(server.endpoint_id(), wait_timeout())
+        .await
+        .unwrap();
+    assert!(
+        !client
+            .topics_ready(server.endpoint_id(), "requests", "responses")
+            .await
+            .unwrap()
+    );
+    let mut requests = server
+        .subscribe("requests", SubscriptionOptions::acknowledged())
+        .await
+        .unwrap();
+    requests
+        .wait_ready(client.endpoint_id(), wait_timeout())
+        .await
+        .unwrap();
+    assert!(
+        client
+            .topics_ready(server.endpoint_id(), "requests", "responses")
+            .await
+            .unwrap()
+    );
+    client.disconnect(server.endpoint_id()).await.unwrap();
+    assert!(
+        !client
+            .topics_ready(server.endpoint_id(), "requests", "responses")
+            .await
+            .unwrap()
+    );
+    close(&server, &client).await;
+}
+
+#[tokio::test]
 async fn persistent_host_recovers_one_use_membership_after_restart() {
     let directory = tempfile::tempdir().unwrap();
     let private = directory.path().join("private");
@@ -141,7 +204,10 @@ async fn burst_publications_do_not_lose_receive_credit_requests() {
     for _ in 0..12 {
         receipts.push(
             topic
-                .publish(publisher.buffers().copy_from_slice(b"burst").unwrap(), options())
+                .publish(
+                    publisher.buffers().copy_from_slice(b"burst").unwrap(),
+                    options(),
+                )
                 .await
                 .unwrap(),
         );

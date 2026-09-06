@@ -133,6 +133,12 @@ pub(crate) enum Command {
         reply: oneshot::Sender<Result<()>>,
     },
     Metrics(oneshot::Sender<Result<Metrics>>),
+    TopicsReady {
+        peer: EndpointId,
+        outgoing: Topic,
+        incoming: Topic,
+        reply: oneshot::Sender<Result<bool>>,
+    },
     Shutdown {
         deadline: Instant,
         reply: oneshot::Sender<Result<Metrics>>,
@@ -448,7 +454,7 @@ impl Owner {
                 }
             }
             Command::Disconnect { peer, reply } => {
-                self.remove_peer(peer);
+                self.remove_peer(peer, "explicit disconnect");
                 let _ = reply.send(Ok(()));
             }
             Command::Subscribe {
@@ -474,7 +480,11 @@ impl Owner {
                 accepted,
                 connected,
             } => {
+                let peer = registration.conn.remote_id();
                 let result = self.register(registration);
+                if let Err(error) = &result {
+                    tracing::warn!(local = %self.endpoint.id(), %peer, %error, "messaging peer registration rejected");
+                }
                 if let Some(reply) = connected {
                     let _ = reply.send(result.as_ref().map(|_| ()).map_err(Clone::clone));
                 }
@@ -490,11 +500,16 @@ impl Owner {
                     .peers
                     .get(&peer)
                     .is_some_and(|p| p.reg.session == session)
-                    && (self.peer_valid(peer, session).is_err()
-                        || self.control(peer, control).is_err())
                 {
-                    self.stats.authorization_failures += 1;
-                    self.remove_peer(peer);
+                    let result = self
+                        .peer_valid(peer, session)
+                        .map(|_| ())
+                        .and_then(|_| self.control(peer, control));
+                    if let Err(error) = result {
+                        tracing::warn!(local = %self.endpoint.id(), %peer, ?session, %error, "messaging control frame rejected");
+                        self.stats.authorization_failures += 1;
+                        self.remove_peer(peer, "control frame rejected");
+                    }
                 }
             }
             Command::Begin {
@@ -508,6 +523,9 @@ impl Owner {
                 ..
             } => {
                 let result = self.begin(peer, session, sub, stream, &signed, len);
+                if let Err(error) = &result {
+                    tracing::warn!(local = %self.endpoint.id(), %peer, ?session, stream, %error, "messaging DATA frame rejected");
+                }
                 let _ = reply.send(result);
             }
             Command::Incoming {
@@ -517,8 +535,9 @@ impl Owner {
                 ticket,
                 payload,
             } => {
-                if self.incoming(peer, session, sub, ticket, payload).is_err() {
-                    self.remove_peer(peer);
+                if let Err(error) = self.incoming(peer, session, sub, ticket, payload) {
+                    tracing::warn!(local = %self.endpoint.id(), %peer, ?session, %error, "messaging payload rejected");
+                    self.remove_peer(peer, "payload rejected");
                 }
             }
             Command::Sent {
@@ -544,7 +563,8 @@ impl Owner {
                     } else if result == Err(Error::SubscriptionClosed) {
                         self.finish(&key, RecipientOutcome::Failed(Error::SubscriptionClosed));
                     } else if result.is_err() {
-                        self.remove_peer(key.0);
+                        tracing::warn!(local = %self.endpoint.id(), peer = %key.0, ?session, error = ?result.err(), "messaging DATA send failed");
+                        self.remove_peer(key.0, "DATA send failed");
                     }
                 }
             }
@@ -554,7 +574,7 @@ impl Owner {
                     .get(&peer)
                     .is_some_and(|p| p.reg.session == session)
                 {
-                    self.remove_peer(peer);
+                    self.remove_peer(peer, "transport session ended");
                 }
             }
             Command::Renew { certificate, reply } => {
@@ -572,7 +592,7 @@ impl Owner {
                     self.cert_updates.send_replace(certificate);
                     let peers: Vec<_> = self.peers.keys().copied().collect();
                     for peer in peers {
-                        self.remove_peer(peer);
+                        self.remove_peer(peer, "certificate renewal");
                     }
                     self.subscriptions
                         .retain(|topic, _| self.cert.allows(topic, false));
@@ -622,6 +642,27 @@ impl Owner {
             Command::Metrics(reply) => {
                 let _ = reply.send(Ok(self.metrics()));
             }
+            Command::TopicsReady {
+                peer,
+                outgoing,
+                incoming,
+                reply,
+            } => {
+                let ready = self.local_valid().map(|_| {
+                    self.drain.is_none()
+                        && self.peers.get(&peer).is_some_and(|p| {
+                            !p.reg.cancel.is_cancelled()
+                                && p.reg.conn.close_reason().is_none()
+                                && self.peer_valid(peer, p.reg.session).is_ok()
+                                && p.outbound.contains_key(&outgoing)
+                                && self
+                                    .subscriptions
+                                    .get(&incoming)
+                                    .is_some_and(|s| s.confirmed.contains(&peer))
+                        })
+                });
+                let _ = reply.send(ready);
+            }
             Command::Shutdown { deadline, reply } => {
                 if self.drain.is_some() {
                     let _ = reply.send(Err(Error::ShuttingDown));
@@ -636,6 +677,7 @@ impl Owner {
     }
     fn send(peer: &Peer, control: Control) {
         if peer.reg.control.try_send(control).is_err() {
+            tracing::warn!(peer = %peer.reg.conn.remote_id(), session = ?peer.reg.session, channel_closed = peer.reg.control.is_closed(), "messaging control queue unavailable; cancelling session");
             peer.reg.cancel.cancel();
         }
     }
@@ -656,7 +698,7 @@ impl Owner {
         }
         reg.cert = reg.cert.metered(&self.metadata)?;
         let memory = self.metadata.reserve(reg.cert.as_bytes().len() + 4096)?;
-        self.remove_peer(peer);
+        self.remove_peer(peer, "replaced by new session");
         for (key, pending) in &mut self.pending {
             if key.0 == peer {
                 pending.recipient_certificate = reg.cert.clone();
@@ -691,10 +733,13 @@ impl Owner {
             );
         }
         self.peers.insert(peer, p);
+        tracing::info!(local = %self.endpoint.id(), %peer, "messaging peer connected");
         Ok(true)
     }
-    fn remove_peer(&mut self, peer: EndpointId) {
-        self.peers.remove(&peer);
+    fn remove_peer(&mut self, peer: EndpointId, reason: &'static str) {
+        if let Some(p) = self.peers.remove(&peer) {
+            tracing::info!(local = %self.endpoint.id(), %peer, session = ?p.reg.session, reason, close_reason = ?p.reg.conn.close_reason(), "messaging peer removed");
+        }
         for s in self.subscriptions.values_mut() {
             s.confirmed.remove(&peer);
             s.grants.remove(&peer);
@@ -1439,15 +1484,15 @@ impl Owner {
             .peers
             .iter()
             .filter_map(|(id, p)| {
-                (local_error.is_some()
-                    || self.config.trust.check(&p.reg.cert, *id, now).is_err()
-                    || p.reg.cancel.is_cancelled()
-                    || p.reg.conn.close_reason().is_some())
-                .then_some(*id)
+                let error = local_error.clone().or_else(|| self.config.trust.check(&p.reg.cert, *id, now).err());
+                if error.is_some() || p.reg.cancel.is_cancelled() || p.reg.conn.close_reason().is_some() {
+                    tracing::warn!(local = %self.endpoint.id(), peer = %id, ?error, cancelled = p.reg.cancel.is_cancelled(), close_reason = ?p.reg.conn.close_reason(), "messaging maintenance found inactive peer");
+                    Some(*id)
+                } else { None }
             })
             .collect();
         for peer in stale {
-            self.remove_peer(peer);
+            self.remove_peer(peer, "maintenance detected inactive peer");
         }
         let closed: Vec<_> = self
             .subscriptions

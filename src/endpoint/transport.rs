@@ -65,6 +65,7 @@ pub(super) async fn connect(
     match connection {
         Ok(conn) => run(conn, true, config, cert, tx, stop, metadata, Some(reply)).await,
         Err(e) => {
+            tracing::warn!(local = %endpoint.id(), error = %e, "messaging connection attempt failed");
             let _ = reply.send(Err(e));
         }
     }
@@ -77,19 +78,38 @@ pub(super) async fn incoming(
     stop: CancellationToken,
     metadata: Arc<Budget>,
 ) {
-    let Ok(accepting) = incoming.accept() else {
-        return;
+    let accepting = match incoming.accept() {
+        Ok(accepting) => accepting,
+        Err(error) => {
+            tracing::warn!(local = %cert.endpoint_id(), %error, "messaging incoming connection rejected");
+            return;
+        }
     };
     let connection = tokio::select! {_=stop.cancelled()=>return,r=timeout(config.handshake_timeout,accepting)=>r};
-    if let Ok(Ok(conn)) = connection {
-        if conn.alpn() == crate::join::ALPN {
-            let _close = Close(conn.clone());
-            tokio::select! {
-                _ = stop.cancelled() => {},
-                _ = timeout(config.handshake_timeout, crate::join::serve(conn, tx)) => {},
+    match connection {
+        Ok(Ok(conn)) => {
+            if conn.alpn() == crate::join::ALPN {
+                let _close = Close(conn.clone());
+                let peer = conn.remote_id();
+                tokio::select! {
+                    _ = stop.cancelled() => {},
+                    result = timeout(config.handshake_timeout, crate::join::serve(conn, tx)) => {
+                        match result {
+                            Ok(Ok(())) => {},
+                            Ok(Err(error)) => tracing::warn!(%peer, %error, "messaging enrollment exchange failed"),
+                            Err(_) => tracing::warn!(%peer, "messaging enrollment exchange timed out"),
+                        }
+                    },
+                }
+            } else {
+                run(conn, false, config, cert, tx, stop, metadata, None).await;
             }
-        } else {
-            run(conn, false, config, cert, tx, stop, metadata, None).await;
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(local = %cert.endpoint_id(), %error, "messaging incoming handshake failed")
+        }
+        Err(_) => {
+            tracing::warn!(local = %cert.endpoint_id(), "messaging incoming handshake timed out")
         }
     }
 }
@@ -199,6 +219,7 @@ async fn run(
     let h = match result {
         Ok(h) => h,
         Err(e) => {
+            tracing::warn!(local = %cert.endpoint_id(), %peer, dialing, error = %e, "messaging handshake failed");
             if let Some(reply) = connected.take() {
                 let _ = reply.send(Err(e));
             }
@@ -253,7 +274,13 @@ async fn run(
             }
             Ok::<(), Error>(())
         };
-        tokio::select! {_=write_cancel.cancelled()=>{},_=result=>{write_cancel.cancel();}}
+        tokio::select! {
+            _=write_cancel.cancelled()=>{},
+            result=result=>{
+                tracing::warn!(%peer, ?session, error = ?result.err(), "messaging control writer ended");
+                write_cancel.cancel();
+            }
+        }
     });
     let read_cancel = cancel.clone();
     let read_tx = tx.clone();
@@ -291,22 +318,55 @@ async fn run(
             }
             Ok::<(), Error>(())
         };
-        tokio::select! {_=read_cancel.cancelled()=>{},_=result=>{read_cancel.cancel();}}
+        tokio::select! {
+            _=read_cancel.cancelled()=>{},
+            result=result=>{
+                tracing::warn!(%peer, ?session, error = ?result.err(), "messaging control reader ended");
+                read_cancel.cancel();
+            }
+        }
     });
     let mut active = 0usize;
     let mut stream_generation = 0u64;
-    loop {
+    let started = Instant::now();
+    let end_reason = loop {
         tokio::select! {
-            _=cancel.cancelled()=>break,
-            _=conn.closed()=>break,
-            stream=conn.accept_uni()=>{
-                let Ok(stream)=stream else{break;};if active>=config.max_topics {break;}active+=1;stream_generation+=1;let stream_id=stream_generation;
-                let tx=tx.clone();let meta=metadata.clone();let stop=cancel.clone();let max=config.max_payload;
-                children.spawn(async move {let _=read_data(stream,stream_id,peer,session,max,tx,meta,stop.clone(),write_timeout).await.map_err(|_|stop.cancel());});
+            _=cancel.cancelled()=>break "local cancellation",
+            error=conn.closed()=>{
+                tracing::warn!(%peer, ?session, %error, "messaging QUIC connection closed");
+                break "QUIC connection closed";
             },
-            Some(_)=children.join_next()=>{active=active.saturating_sub(1);},
+            stream=conn.accept_uni()=>{
+                let stream = match stream {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        tracing::warn!(%peer, ?session, %error, "messaging stream accept failed");
+                        break "stream accept failed";
+                    }
+                };
+                if active>=config.max_topics {
+                    tracing::warn!(%peer, ?session, active, limit=config.max_topics, "messaging inbound stream limit exceeded");
+                    break "inbound stream limit";
+                }
+                active+=1;stream_generation+=1;let stream_id=stream_generation;
+                let tx=tx.clone();let meta=metadata.clone();let stop=cancel.clone();let max=config.max_payload;
+                children.spawn(async move {
+                    if let Err(error) = read_data(stream,stream_id,peer,session,max,tx,meta,stop.clone(),write_timeout).await {
+                        tracing::warn!(%peer, ?session, stream=stream_id, %error, "messaging DATA reader failed");
+                        stop.cancel();
+                    }
+                });
+            },
+            Some(result)=children.join_next()=>{
+                if let Err(error) = result {
+                    tracing::warn!(%peer, ?session, %error, "messaging session task failed");
+                    break "session task failed";
+                }
+                active=active.saturating_sub(1);
+            },
         }
-    }
+    };
+    tracing::info!(local = %cert.endpoint_id(), %peer, ?session, reason=end_reason, lifetime_ms=started.elapsed().as_millis(), close_reason=?conn.close_reason(), "messaging transport session ended");
     cancel.cancel();
     children.abort_all();
     while children.join_next().await.is_some() {}
@@ -426,6 +486,7 @@ pub(super) async fn write_data(
     tokio::select! {
         _=cancel.cancelled()=>{},
         result=run=>{ if result.is_err() && result != Err(Error::SubscriptionClosed) {
+            tracing::warn!(peer = %conn.remote_id(), ?session, error = ?result.err(), "messaging DATA writer failed");
             conn.close(0u32.into(), b"data writer failed");
             let _ = tx.send(Command::End { peer: conn.remote_id(), session }).await;
         }}

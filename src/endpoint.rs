@@ -297,6 +297,23 @@ impl MessagingEndpoint {
         .await
     }
 
+    /// Create or resume a host with application-managed durable storage.
+    /// The endpoint identity must be persisted separately by the application.
+    pub async fn host_with_storage(
+        config: Config,
+        identity: Identity,
+        permissions: Vec<Permission>,
+        storage: Arc<dyn crate::HostStorage>,
+    ) -> Result<Self> {
+        Self::host_with_admission(
+            config,
+            identity,
+            permissions,
+            crate::join::Admission::with_storage(storage)?,
+        )
+        .await
+    }
+
     async fn host_with_admission(
         config: Config,
         identity: Identity,
@@ -535,6 +552,26 @@ impl MessagingEndpoint {
     }
     pub async fn metrics(&self) -> Result<Metrics> {
         self.handle.request(Command::Metrics).await
+    }
+    /// Snapshot whether a live peer has subscribed to `outgoing` and accepted
+    /// our subscription to `incoming`. A connection alone is not topic readiness.
+    /// This is not a reservation: callers must still handle publish failures.
+    pub async fn topics_ready(
+        &self,
+        peer: EndpointId,
+        outgoing: impl AsRef<str>,
+        incoming: impl AsRef<str>,
+    ) -> Result<bool> {
+        let outgoing = Topic::new(outgoing)?;
+        let incoming = Topic::new(incoming)?;
+        self.handle
+            .request(|reply| Command::TopicsReady {
+                peer,
+                outgoing,
+                incoming,
+                reply,
+            })
+            .await
     }
     pub async fn shutdown(&self, mode: ShutdownMode) -> Result<Metrics> {
         let deadline = match mode {

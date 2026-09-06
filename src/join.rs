@@ -214,15 +214,30 @@ pub(crate) struct Host {
     authority: Authority,
     codes: BTreeMap<[u8; 16], Grant>,
     members: BTreeMap<[u8; 16], Member>,
-    storage: Option<PersistentFile>,
+    storage: Option<Arc<dyn HostStorage>>,
+}
+
+/// Application-managed storage for the host authority, grants, and membership records.
+/// These opaque bytes contain private keys and must be kept confidential. `save` must
+/// atomically and durably replace the entire value before returning success. Calls are
+/// synchronous and serialized by the endpoint owner, as with file persistence.
+pub trait HostStorage: Send + Sync + 'static {
+    fn load(&self) -> Result<Option<Vec<u8>>>;
+    fn save(&self, bytes: &[u8]) -> Result<()>;
+}
+
+/// Generate a new private authority and empty enrollment state without starting a transport.
+/// Store these opaque bytes securely and return them from `HostStorage::load` when hosting.
+pub fn generate_host_state() -> Vec<u8> {
+    Host::new(Authority::generate(), None).encode()
 }
 
 #[derive(Clone)]
-struct PersistentFile {
+struct FileHostStorage {
     path: PathBuf,
 }
 
-impl PersistentFile {
+impl FileHostStorage {
     const MAX_BYTES: usize = 4 * 1024 * 1024;
 
     fn new(path: impl AsRef<Path>) -> Self {
@@ -231,7 +246,7 @@ impl PersistentFile {
         }
     }
 
-    fn load(&self) -> Result<Option<Vec<u8>>> {
+    fn load_file(&self) -> Result<Option<Vec<u8>>> {
         let parent = self.parent();
         if parent.exists() {
             Self::validate_parent(parent)?;
@@ -258,7 +273,7 @@ impl PersistentFile {
         Ok(Some(bytes))
     }
 
-    fn save(&self, bytes: &[u8]) -> Result<()> {
+    fn save_file(&self, bytes: &[u8]) -> Result<()> {
         if bytes.len() > Self::MAX_BYTES {
             return Err(Error::MessageTooLarge);
         }
@@ -333,8 +348,18 @@ impl PersistentFile {
     }
 }
 
+impl HostStorage for FileHostStorage {
+    fn load(&self) -> Result<Option<Vec<u8>>> {
+        self.load_file()
+    }
+
+    fn save(&self, bytes: &[u8]) -> Result<()> {
+        self.save_file(bytes)
+    }
+}
+
 impl Host {
-    fn new(authority: Authority, storage: Option<PersistentFile>) -> Self {
+    fn new(authority: Authority, storage: Option<Arc<dyn HostStorage>>) -> Self {
         Self {
             authority,
             codes: BTreeMap::new(),
@@ -398,7 +423,10 @@ impl Host {
         writer.finish()
     }
 
-    fn decode(bytes: &[u8], storage: PersistentFile) -> Result<Self> {
+    fn decode(bytes: &[u8], storage: Arc<dyn HostStorage>) -> Result<Self> {
+        if bytes.len() > FileHostStorage::MAX_BYTES {
+            return Err(Error::MessageTooLarge);
+        }
         let mut reader = Reader::new(bytes);
         reader.array(6)?;
         if reader.u()? != 1 {
@@ -505,7 +533,11 @@ impl Host {
 
     fn persist(&self) -> Result<()> {
         if let Some(storage) = &self.storage {
-            storage.save(&self.encode())?;
+            let bytes = self.encode();
+            if bytes.len() > FileHostStorage::MAX_BYTES {
+                return Err(Error::MessageTooLarge);
+            }
+            storage.save(&bytes)?;
         }
         Ok(())
     }
@@ -539,7 +571,9 @@ impl Admission {
         Self::Host(Box::new(Host::new(authority, None)))
     }
     pub fn persistent(path: impl AsRef<Path>) -> Result<Self> {
-        let storage = PersistentFile::new(path);
+        Self::with_storage(Arc::new(FileHostStorage::new(path)))
+    }
+    pub fn with_storage(storage: Arc<dyn HostStorage>) -> Result<Self> {
         let host = match storage.load()? {
             Some(bytes) => Host::decode(&bytes, storage)?,
             None => {
@@ -625,15 +659,23 @@ impl Admission {
                 _memory: Some(memory),
             },
         );
-        host.persist()?;
+        if let Err(error) = host.persist() {
+            host.codes.remove(&code.id());
+            return Err(error);
+        }
         Ok(code)
     }
     pub fn revoke_code(&mut self, id: [u8; 16]) -> Result<()> {
         let Self::Host(host) = self else {
             return Err(Error::Unauthorized);
         };
-        host.codes.remove(&id);
-        host.persist()?;
+        let removed = host.codes.remove(&id);
+        if let Err(error) = host.persist() {
+            if let Some(grant) = removed {
+                host.codes.insert(id, grant);
+            }
+            return Err(error);
+        }
         Ok(())
     }
     #[allow(clippy::too_many_arguments)]
@@ -698,12 +740,29 @@ impl Admission {
                 _memory: Some(memory),
             },
         );
-        host.codes
+        let previous = host
+            .codes
             .get_mut(&id)
             .expect("grant checked above")
             .redeemed
             .insert(peer, cert.clone());
-        host.persist()?;
+        if let Err(error) = host.persist() {
+            host.members.remove(&cert.id());
+            let redeemed = &mut host
+                .codes
+                .get_mut(&id)
+                .expect("grant checked above")
+                .redeemed;
+            match previous {
+                Some(previous) => {
+                    redeemed.insert(peer, previous);
+                }
+                None => {
+                    redeemed.remove(&peer);
+                }
+            }
+            return Err(error);
+        }
         Ok(Enrollment {
             trust: host.authority.trust(),
             expires: grant_expires,
@@ -890,6 +949,118 @@ pub(crate) async fn serve(conn: Connection, tx: mpsc::Sender<Command>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    struct TestStorage {
+        bytes: Mutex<Vec<u8>>,
+        fail: AtomicBool,
+    }
+
+    impl HostStorage for TestStorage {
+        fn load(&self) -> Result<Option<Vec<u8>>> {
+            Ok(Some(self.bytes.lock().unwrap().clone()))
+        }
+
+        fn save(&self, bytes: &[u8]) -> Result<()> {
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(Error::Io("test storage failure".into()));
+            }
+            *self.bytes.lock().unwrap() = bytes.to_vec();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn application_storage_rolls_back_failed_grants_revocations_and_enrollments() {
+        let storage = Arc::new(TestStorage {
+            bytes: Mutex::new(generate_host_state()),
+            fail: AtomicBool::new(false),
+        });
+        let mut admission = Admission::with_storage(storage.clone()).unwrap();
+        let identity = Identity::generate();
+        assert_eq!(
+            Identity::from_bytes(&identity.to_bytes()).endpoint_id(),
+            identity.endpoint_id()
+        );
+        let address = EndpointAddr::new(identity.endpoint_id())
+            .with_ip_addr("127.0.0.1:42000".parse().unwrap());
+        let options = JoinOptions::new(vec![Permission::publish("jobs").unwrap()]);
+        let budget = Budget::new(1024 * 1024);
+        let now = auth::now().unwrap();
+        storage.fail.store(true, Ordering::Relaxed);
+        assert!(
+            admission
+                .issue(options.clone(), address.clone(), now, &budget, 1)
+                .is_err()
+        );
+        storage.fail.store(false, Ordering::Relaxed);
+        // A failed issuance must not consume the only grant slot.
+        let code = admission.issue(options, address, now, &budget, 1).unwrap();
+        let trust = admission.authority().unwrap().trust();
+        let peer = Identity::generate().endpoint_id();
+        storage.fail.store(true, Ordering::Relaxed);
+        assert!(admission.revoke_code(code.id()).is_err());
+        for _ in 0..2 {
+            // Retrying a failed enrollment must not return an uncommitted cached certificate.
+            assert!(matches!(
+                admission.enroll(
+                    peer,
+                    code.id(),
+                    code.secret,
+                    now,
+                    now + 3600,
+                    &trust,
+                    &budget,
+                    1
+                ),
+                Err(Error::Io(_))
+            ));
+        }
+        storage.fail.store(false, Ordering::Relaxed);
+        let enrolled = admission
+            .enroll(
+                peer,
+                code.id(),
+                code.secret,
+                now,
+                now + 3600,
+                &trust,
+                &budget,
+                1,
+            )
+            .unwrap();
+        let resumed = Admission::with_storage(storage.clone()).unwrap();
+        assert!(resumed.check(peer, &enrolled.certificate).is_ok());
+        storage.fail.store(true, Ordering::Relaxed);
+        // Already committed enrollments can still return their durable cached reply.
+        assert!(
+            admission
+                .enroll(
+                    peer,
+                    code.id(),
+                    code.secret,
+                    now,
+                    now + 3600,
+                    &trust,
+                    &budget,
+                    1
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn application_storage_rejects_invalid_state_without_replacing_it() {
+        let storage = Arc::new(TestStorage {
+            bytes: Mutex::new(vec![0]),
+            fail: AtomicBool::new(false),
+        });
+        assert!(Admission::with_storage(storage.clone()).is_err());
+        assert_eq!(*storage.bytes.lock().unwrap(), vec![0]);
+    }
 
     #[test]
     fn service_credentials_allow_ten_years_but_not_longer() {

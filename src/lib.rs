@@ -20,7 +20,7 @@ pub use endpoint::{
 pub use error::{Error, Result};
 pub use identity::Identity;
 pub use iroh::{EndpointId, RelayMode};
-pub use join::{JoinCode, JoinOptions, MAX_JOIN_LIFETIME};
+pub use join::{HostStorage, JoinCode, JoinOptions, MAX_JOIN_LIFETIME, generate_host_state};
 pub use message::{DeliveryMode, MessageId, Nack, Topic};
 
 #[cfg(test)]
